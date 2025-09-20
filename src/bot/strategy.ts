@@ -1,6 +1,24 @@
+
+
 /**
  * عند تسجيل صفقة شراء، احفظ سعر الدخول والهدف وأضف أمر بيع pending
  */
+// Module-level helper to normalize transaction signature extraction
+function extractTxFromResult(res: any): string | undefined {
+  if (!res) return undefined;
+  if (typeof res === 'string') return res;
+  if ((res as any).tx) return String((res as any).tx);
+  if ((res as any).txSignature) return String((res as any).txSignature);
+  if ((res as any).signature) return String((res as any).signature);
+  if ((res as any).txSignature) return String((res as any).txSignature);
+  if ((res as any).buyResult) {
+    const br = (res as any).buyResult;
+    if (br.tx) return String(br.tx);
+    if (br.signature) return String(br.signature);
+  }
+  return undefined;
+}
+
 export function registerBuyWithTarget(user: any, token: any, buyResult: any, targetPercent = 10) {
   // تأكد من وجود معرف المستخدم داخل الكائن
   const userId = user.id || user.userId || user.telegramId;
@@ -48,7 +66,7 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
 
   const entryPrice = token.price || token.entryPrice || null;
   const amount = user.strategy.buyAmount || 0.01;
-  const tx = buyResult?.tx;
+  const tx = extractTxFromResult(buyResult);
   // سجل صفقة الشراء
   const buyTrade: TradeEntry = {
     id: genId(),
@@ -155,9 +173,11 @@ export async function monitorAndAutoSellTrades(user: any, tokens: any[], priceFi
       try {
         const result = await unifiedSell(token.address, sell.amount, user.secret /*, { slippage: user.strategy.slippage }*/);
         const { fee, slippage } = extractTradeMeta(result, 'sell');
+        // Normalize tx
+        const sellTx = extractTxFromResult(result);
         // حدث حالة الأمر من pending إلى success
-        sell.status = result?.tx ? 'success' : 'fail';
-        sell.tx = result?.tx;
+        sell.status = sellTx ? 'success' : 'fail';
+        sell.tx = sellTx;
         sell.fee = fee;
         sell.slippage = slippage;
         sell.executedTime = Date.now();
@@ -205,18 +225,19 @@ export async function executeBatchTradesForUser(user: any, tokens: any[], mode: 
   }
   for (const token of tokens) {
     try {
-      let result, amount, tx = null;
+      let result: any;
+      let amount: number;
+      let tx: string | undefined;
       if (mode === 'buy') {
         amount = user.strategy.buyAmount || 0.01;
         result = await unifiedBuy(token.address, amount, user.secret /*, { slippage }*/);
-        tx = result?.tx;
       } else {
         const sellPercent = user.strategy.sellPercent1 || 100;
         const balance = token.balance || 0;
         amount = (balance * sellPercent) / 100;
         result = await unifiedSell(token.address, amount, user.secret /*, { slippage }*/);
-        tx = result?.tx;
       }
+      tx = extractTxFromResult(result);
       const { fee, slippage } = extractTradeMeta(result, mode);
       userTrades.push({
         mode,

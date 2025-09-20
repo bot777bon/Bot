@@ -28,6 +28,20 @@ console.log('--- Telegraf instance created ---');
 function escapeHtml(str: string){
   return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+// Helper to normalize various shapes returned by unifiedBuy/unifiedSell
+function extractTx(res: any): string | null {
+  if (!res) return null;
+  if (typeof res === 'string') return res;
+  if (res.tx) return String(res.tx);
+  if ((res as any).txSignature) return String((res as any).txSignature);
+  if ((res as any).signature) return String((res as any).signature);
+  if ((res as any).buyResult) {
+    const br = (res as any).buyResult;
+    if (br.tx) return String(br.tx);
+    if (br.signature) return String(br.signature);
+  }
+  return null;
+}
 let users: Record<string, any> = loadUsers();
 console.log('--- Users loaded ---');
 // Optional: start sniper in-process and forward notifications to Telegram users.
@@ -260,44 +274,75 @@ bot.hears('سنايبر', async (ctx) => {
         return;
       }
     }
-    // Send each collected token as a payload-style message (array line then detailed JSON)
-    for(const tok of res){
-      try{
-        const mint = (tok as any).tokenAddress || (tok as any).address || (tok as any).mint || String(tok);
-        const collectorPayload: any = {
-          time: new Date().toISOString(),
-          program: (tok as any).sourceProgram || null,
-          signature: (tok as any).sourceSignature || null,
-          kind: (tok as any).kind || 'initialize',
-          freshMints: [mint],
-          ageSeconds: (tok as any)._canonicalAgeSeconds || null,
-          firstBlock: (tok as any).firstBlockTime ? Math.floor((tok as any).firstBlockTime/1000) : null,
-          txBlock: (tok as any).txBlock || null,
-          sampleLogs: (tok as any).sampleLogs || [],
-        };
-        // Prefer the same HTML + inline keyboard used by Show Token (buildTokenMessage)
-        try{
-          const botUsername = process.env.BOT_USERNAME || 'YourBotUsername';
-          const pairAddress = (tok as any).pairAddress || (tok as any).tokenAddress || (tok as any).address || (tok as any).mint || '';
-          // buildTokenMessage is imported at top; use it when available
-          if(typeof buildTokenMessage === 'function'){
-            try{
+    // Build a single combined message for all collected tokens (like /show_token behavior)
+    try {
+      const botUsername = bot.botInfo?.username || process.env.BOT_USERNAME || 'YourBotUsername';
+      // respect per-user limit preference
+      const defaultLimit = 3;
+      let userLimit = defaultLimit;
+      try {
+        const v = user && user.strategy && (user.strategy.maxTrades || user.strategy.listenerMaxCollect || user.strategy.maxCollect);
+        const n = Number(v);
+        if (!isNaN(n) && n > 0) userLimit = Math.max(1, Math.min(20, Math.floor(n)));
+      } catch (e) {}
+      const limit = Math.min(userLimit, Array.isArray(res) ? res.length : 0);
+
+      let combinedMsg = '';
+      const combinedKeyboard: any[] = [];
+
+      for (let i = 0; i < limit; i++) {
+        const tok = res[i];
+        try {
+          const pairAddress = tok.pairAddress || tok.tokenAddress || tok.address || tok.mint || '';
+          if (typeof buildTokenMessage === 'function') {
+            try {
               const built = buildTokenMessage(tok, botUsername, pairAddress, userId);
-              if(built && built.msg){
-                // send the rich HTML message with inline keyboard if available
-                await bot.telegram.sendMessage(Number(userId) || userId, built.msg, { parse_mode: 'HTML', reply_markup: built.inlineKeyboard || undefined } as any);
+              if (built && built.msg) {
+                if (combinedMsg) combinedMsg += '\n\n------------------------------\n\n';
+                combinedMsg += built.msg;
+                // merge callback rows that contain callback_data
+                if (Array.isArray(built.inlineKeyboard)) {
+                  for (const row of built.inlineKeyboard) {
+                    try {
+                      const hasCb = Array.isArray(row) && row.some((b: any) => b && b.callback_data);
+                      if (hasCb) combinedKeyboard.push(row);
+                    } catch (e) {}
+                  }
+                }
                 continue;
               }
-            }catch(e){ /* fallthrough to preformatted JSON */ }
+            } catch (e) { /* fallthrough to fallback for this token */ }
           }
-          // fallback: send array line then detailed JSON in <pre>
-          await ctx.replyWithHTML(`<pre>${escapeHtml(JSON.stringify([mint]))}</pre>`, { disable_web_page_preview: true } as any);
-          await ctx.replyWithHTML(`<pre>${escapeHtml(JSON.stringify(collectorPayload, null, 2))}</pre>`, { disable_web_page_preview: true } as any);
-        }catch(e){
-          // fallback: simple text
-          await ctx.reply(`Mint: ${mint}`);
+          // fallback: append a simple line for the mint
+          const mint = tok && (tok.tokenAddress || tok.address || tok.mint) ? (tok.tokenAddress || tok.address || tok.mint) : String(tok);
+          if (combinedMsg) combinedMsg += '\n\n------------------------------\n\n';
+          combinedMsg += `<pre>${escapeHtml(JSON.stringify([mint]))}</pre>`;
+        } catch (e) {
+          // ignore per-token errors
+          console.error('[سنايبر->build] token build failed', e);
         }
-      }catch(e){ console.error('[سنايبر->send] token send failed', e); }
+      }
+
+      if (combinedMsg) {
+        try {
+          const replyMarkup: any = {};
+          if (combinedKeyboard.length) replyMarkup.inline_keyboard = combinedKeyboard;
+          await bot.telegram.sendMessage(Number(userId) || userId, combinedMsg, { parse_mode: 'HTML', reply_markup: (Object.keys(replyMarkup).length ? replyMarkup : undefined) } as any);
+        } catch (e) {
+          // fallback: send JSON of entire response in one message
+          try {
+            await ctx.replyWithHTML(`<pre>${escapeHtml(JSON.stringify(res, null, 2))}</pre>`, { disable_web_page_preview: true } as any);
+          } catch (e2) { console.error('[سنايبر->send] final fallback failed', e2); }
+        }
+      } else {
+        // nothing built — send the full payload as a single pre block
+        try {
+          await ctx.replyWithHTML(`<pre>${escapeHtml(JSON.stringify(res, null, 2))}</pre>`, { disable_web_page_preview: true } as any);
+        } catch (e) { console.error('[سنايبر->send] fallback failed', e); }
+      }
+    } catch (e) {
+      console.error('[سنايبر->send] combined message failed', e);
+      try { await ctx.reply('Mint: ' + JSON.stringify(res)); } catch (_) {}
     }
   }catch(e){
     console.error('سنايبر collector error', (e as any) && (e as any).message || e);
@@ -365,10 +410,11 @@ bot.action(/buy_(.+)/, async (ctx: any) => {
     }
     await ctx.reply(`🛒 Buying token: <code>${tokenAddress}</code> with amount: <b>${amount}</b> SOL ...`, { parse_mode: 'HTML' });
     const result = await unifiedBuy(tokenAddress, amount, user.secret);
-    if (result && result.tx) {
+    const txSig = extractTx(result);
+    if (txSig) {
       if (!boughtTokens[userId]) boughtTokens[userId] = new Set();
       boughtTokens[userId].add(tokenAddress);
-      const entry = `ManualBuy: ${tokenAddress} | Amount: ${amount} SOL | Source: unifiedBuy | Tx: ${result.tx}`;
+      const entry = `ManualBuy: ${tokenAddress} | Amount: ${amount} SOL | Source: unifiedBuy | Tx: ${txSig}`;
       user.history = user.history || [];
       user.history.push(entry);
       limitHistory(user);
@@ -409,8 +455,9 @@ bot.action(/sell_(.+)/, async (ctx: any) => {
     const amount = (balance * sellPercent) / 100;
     await ctx.reply(`🔻 Selling token: <code>${tokenAddress}</code> with <b>${sellPercent}%</b> of your balance (${balance}) ...`, { parse_mode: 'HTML' });
     const result = await unifiedSell(tokenAddress, amount, user.secret);
-    if (result?.tx) {
-      const entry = `ManualSell: ${tokenAddress} | Amount: ${amount} | Source: unifiedSell | Tx: ${result.tx}`;
+    const sellTx = extractTx(result);
+    if (sellTx) {
+      const entry = `ManualSell: ${tokenAddress} | Amount: ${amount} | Source: unifiedSell | Tx: ${sellTx}`;
       user.history = user.history || [];
       user.history.push(entry);
       limitHistory(user);
@@ -678,10 +725,11 @@ bot.on('text', async (ctx, next) => {
           try {
             const buyResult = await unifiedBuy(tokenAddress, buyAmount, user.secret);
             console.log(`[show_token] Buy result:`, buyResult);
-            if (buyResult && buyResult.tx) {
+            const buyTx = extractTx(buyResult);
+            if (buyTx) {
               successCount++;
               // سجل العملية في التاريخ
-              const entry = `AutoShowTokenBuy: ${tokenAddress} | Amount: ${buyAmount} SOL | Source: unifiedBuy | Tx: ${buyResult.tx}`;
+              const entry = `AutoShowTokenBuy: ${tokenAddress} | Amount: ${buyAmount} SOL | Source: unifiedBuy | Tx: ${buyTx}`;
               user.history = user.history || [];
               user.history.push(entry);
               limitHistory(user);
@@ -689,7 +737,7 @@ bot.on('text', async (ctx, next) => {
               // سجل أمر بيع تلقائي
               const targetPercent = user.strategy.targetPercent || 10;
               registerBuyWithTarget(user, { address: tokenAddress, price }, buyResult, targetPercent);
-              buyResults.push(`🟢 <b>${name}</b> (<code>${tokenAddress}</code>)\nPrice: <b>${price}</b> USD\nAmount: <b>${buyAmount}</b> SOL\nTx: <a href='https://solscan.io/tx/${buyResult.tx}'>${buyResult.tx}</a>\n<a href='${dexUrl}'>DexScreener</a> | <a href='https://solscan.io/token/${tokenAddress}'>Solscan</a>\n------------------------------`);
+              buyResults.push(`🟢 <b>${name}</b> (<code>${tokenAddress}</code>)\nPrice: <b>${price}</b> USD\nAmount: <b>${buyAmount}</b> SOL\nTx: <a href='https://solscan.io/tx/${buyTx}'>${buyTx}</a>\n<a href='${dexUrl}'>DexScreener</a> | <a href='https://solscan.io/token/${tokenAddress}'>Solscan</a>\n------------------------------`);
             } else {
               failCount++;
               console.log(`[show_token] Buy failed for token: ${tokenAddress}`);
@@ -719,13 +767,14 @@ bot.action(/showtoken_buy_(.+)/, async (ctx) => {
     const amount = user.strategy.buyAmount || 0.01;
     await ctx.reply(`🛒 Buying token: <code>${tokenAddress}</code> with amount: <b>${amount}</b> SOL ...`, { parse_mode: 'HTML' });
     const result = await unifiedBuy(tokenAddress, amount, user.secret);
-    if (result && result.tx) {
-      const entry = `ShowTokenBuy: ${tokenAddress} | Amount: ${amount} SOL | Source: unifiedBuy | Tx: ${result.tx}`;
+    const showTx = extractTx(result);
+    if (showTx) {
+      const entry = `ShowTokenBuy: ${tokenAddress} | Amount: ${amount} SOL | Source: unifiedBuy | Tx: ${showTx}`;
       user.history = user.history || [];
       user.history.push(entry);
       limitHistory(user);
       saveUsers(users);
-      await ctx.reply(`Token bought successfully! Tx: ${result.tx}`);
+      await ctx.reply(`Token bought successfully! Tx: ${showTx}`);
     } else {
       await ctx.reply('Buy failed: Transaction was not completed.');
     }

@@ -1,3 +1,23 @@
+import path from 'path';
+/**
+ * تحقق هل المستخدم اشترى العملة مسبقًا ولم يبعها بعد
+ */
+export function hasPendingBuy(userId: string, tokenAddress: string): boolean {
+  if (!userId || userId === 'undefined') {
+    console.warn('[hasPendingBuy] Invalid userId, skipping check.');
+    return false;
+  }
+  const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
+  const userFile = path.join(sentTokensDir, `${userId}.json`);
+  if (!fs.existsSync(userFile)) return false;
+  try {
+    const userTrades = JSON.parse(fs.readFileSync(userFile, 'utf8'));
+    return userTrades.some((t: any) => t.mode === 'buy' && t.token === tokenAddress && t.status === 'success' &&
+      !userTrades.some((s: any) => s.mode === 'sell' && s.token === tokenAddress && s.status === 'success'));
+  } catch {
+    return false;
+  }
+}
 import fs from 'fs';
 import { Markup } from 'telegraf';
 

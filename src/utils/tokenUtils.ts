@@ -383,6 +383,18 @@ function buildInlineKeyboard(token: any, botUsername: string, pairAddress: strin
   const shareUrl = `https://t.me/share/url?url=https://t.me/${botUsername}?start=${shareId}`;
   const row2: any[] = [ { text: `${shareEmoji} Share`, url: shareUrl } ];
   inlineKeyboard.push(row2);
+  // Row 3: Buy / Sell buttons (callback) to match show-token handlers
+  try {
+    const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || '';
+    if (addr) {
+      const buyText = '🟢 Buy';
+      const sellText = '🔴 Sell';
+      // Use showtoken_* callbacks to align with existing show_token handlers
+      const buyCb = `showtoken_buy_${addr}`;
+      const sellCb = `showtoken_sell_${addr}`;
+      inlineKeyboard.push([ { text: buyText, callback_data: buyCb }, { text: sellText, callback_data: sellCb } ]);
+    }
+  } catch (e) { /* ignore */ }
   return { inlineKeyboard };
 }
 

@@ -1,5 +1,18 @@
 import TelegramBot from "node-telegram-bot-api";
-import { TokenService } from "../services/token.metadata";
+// Minimal inline TokenService stub
+const TokenService = new (class {
+  async fetchSimpleMetaData(_pubkey: any) {
+    return { name: "Unknown", symbol: "UNK" };
+  }
+  async getMintMetadata(_conn: any, _mint: any) {
+    return { parsed: { info: { decimals: 9, supply: "1000000000", freezeAuthority: null, mintAuthority: null } }, program: "spl-token" };
+  }
+  async getSOLPrice() { return 20; }
+  async getSPLBalance(_mint: string, _wallet: string, _isToken2022: boolean, _raw?: boolean) { return 0; }
+  async getSOLBalance(_wallet: string) { return 0; }
+  async getMintInfo(mint: string) { return { overview: { name: `TOK-${mint.slice(0,6)}`, symbol: `T${mint.slice(0,4)}`, price: 0, mc: 0, decimals: 9 }, secureinfo: { isToken2022: false, ownerAddress: null, freezeAuthority: null, top10HolderPercent: 0 } } }
+  async getTokenSecurity(_mint: string) { return { top10HolderPercent: 0 }; }
+})();
 import {
   birdeyeLink,
   contractLink,
@@ -10,22 +23,56 @@ import {
   formatPrice,
   fromWeiToValue,
 } from "../utils";
-import { UserService } from "../services/user.service";
+const fs = require("fs");
+const usersPath = `${process.cwd()}/users.json`;
+const UserService: any = new (class {
+  async findOne(_q: any) {
+    try {
+      const raw = fs.readFileSync(usersPath, "utf8");
+      const obj = JSON.parse(raw);
+      return Object.values(obj)[0] || null;
+    } catch (e) {
+      return null;
+    }
+  }
+  async updateMany(_f:any,_d:any){ return true }
+  async findAndUpdateOne(_q:any,_d:any){ return true }
+})();
 import {
   sendNoneExistTokenNotification,
   sendNoneUserNotification,
   sendUsernameRequiredNotification,
 } from "./common.screen";
-import {
-  GasFeeEnum,
-  UserTradeSettingService,
-} from "../services/user.trade.setting.service";
-import { MsgLogService } from "../services/msglog.service";
+const UserTradeSettingService = new (class {
+  async getSlippage(_username: string) { return { slippage: 1 }; }
+  async getGas(_username: string) { return { gas: 0.000005 }; }
+  getGasValue(setting: any) { return setting?.gas ?? 0.000005; }
+  async getJitoFee(_username: string) { return { enabled: false }; }
+  getJitoFeeValue(_setting: any) { return 0; }
+})();
+const MsgLogService = new (class {
+  async create(_obj: any) { return true; }
+  async findOne(_q: any) { return null; }
+})();
 import { autoBuyHandler } from "./trade.screen";
-import { JupiterService, QuoteRes } from "../services/jupiter.service";
+class JupiterService {
+  async checkTradableOnJupiter(_mint: string) { return false; }
+  async getQuote(_mint: string, _out: string, _amount: number, _decIn: number, _decOut: number) { return null; }
+}
+type QuoteRes = any;
 import { NATIVE_MINT } from "@solana/spl-token";
-import { PNLService } from "../services/pnl.service";
-import { RaydiumTokenService } from "../services/raydium.token.service";
+class PNLService {
+  constructor(_wallet?: string, _mint?: string, _quote?: any) {}
+  async initialize() {}
+  async getPNLInfo() { return null; }
+  async getBoughtAmount() { return 0; }
+  async getPNLCard(_data: any) { return { pnlUrl: "" }; }
+  async afterSell(_out: number, _percent: number) {}
+}
+const RaydiumTokenService = new (class {
+  async findLastOne(_q: any) { return null; }
+  async findOneAndUpdate(_obj: any) { return null; }
+})();
 import {
   PNL_SHOW_THRESHOLD_USD,
   RAYDIUM_PASS_TIME,
@@ -40,7 +87,7 @@ import {
   syncClmmPoolKeys,
 } from "../raydium/raydium.service";
 import { getCoinData } from "../pump/api";
-import { TokenSecurityInfoDataType } from "../services/birdeye.api.service";
+// TokenSecurityInfoDataType not required in stub
 
 export const inline_keyboards = [
   [{ text: "🖼 Generate PNL Card", command: "pnl_card" }],

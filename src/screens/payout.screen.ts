@@ -3,7 +3,19 @@ import { copytoclipboard } from "../utils";
 import { INPUT_SOL_ADDRESS } from "../bot.opts";
 import { isValidWalletAddress } from "../utils";
 import { OpenReferralWindowHandler } from "./referral.link.handler";
-import { UserService } from "../services/user.service";
+const fs = require("fs");
+const usersPath = `${process.cwd()}/users.json`;
+const UserService: any = new (class {
+  async findOne(query: any) {
+    try {
+      const raw = fs.readFileSync(usersPath, "utf8");
+      const obj = JSON.parse(raw);
+      return Object.values(obj)[0] || null;
+    } catch (e) {
+      return null;
+    }
+  }
+})();
 
 export const sendPayoutAddressManageScreen = async (
   bot: TelegramBot,

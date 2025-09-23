@@ -1,0 +1,14 @@
+export const BUY_XSOL_TEXT = "Enter amount to buy (SOL)";
+export const PRESET_BUY_TEXT = "Enter preset buy amount";
+export const SELL_XPRO_TEXT = "Enter amount to sell";
+export const SET_SLIPPAGE_TEXT = "Set slippage (in %)";
+export const TradeBotID = process.env.TRADE_BOT_ID || "GrowTradeBot";
+export const INPUT_SOL_ADDRESS = "Please send a SOL address to set payout";
+export const AutoBuyText = "Auto buy text";
+export const WITHDRAW_TOKEN_AMT_TEXT = "Enter withdraw amount";
+export const WITHDRAW_XTOKEN_TEXT = "Enter custom withdraw amount";
+export const WELCOME_REFERRAL = "";
+export const AlertBotID = process.env.ALERT_BOT_ID || "AlertBot";
+export const AUTO_BUY_TEXT = "Enter auto buy amount";
+export const SET_GAS_FEE = "Set gas fee";
+export const SET_JITO_FEE = "Set jito fee";

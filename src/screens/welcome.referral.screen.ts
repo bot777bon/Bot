@@ -4,10 +4,8 @@ import TelegramBot, {
 } from "node-telegram-bot-api";
 import { TradeBotID, WELCOME_REFERRAL } from "../bot.opts";
 import { copytoclipboard } from "../utils";
-import {
-  get_referral_amount,
-  get_referral_num,
-} from "../services/referral.service";
+const get_referral_amount = async (_uniquecode: string) => ({ totalAmount: 0 });
+const get_referral_num = async (_uniquecode: string) => ({ num: 0 });
 
 export const showWelcomeReferralProgramMessage = async (
   bot: TelegramBot,

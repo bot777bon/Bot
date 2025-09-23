@@ -1,13 +1,66 @@
 import TelegramBot, { InlineKeyboardButton } from "node-telegram-bot-api";
-import { TokenService } from "../services/token.metadata";
+
+// Minimal in-file TokenService to replace missing ../services/token.metadata
+const TokenService = new (class {
+  async getTokenAccounts(_wallet: string) {
+    // Return empty set for local runs
+    return [] as Array<{ mint: string; amount: number; symbol?: string }>;
+  }
+  async getSOLBalance(_wallet: string) {
+    return 0;
+  }
+  async getSOLPrice() {
+    return 20;
+  }
+})();
 import { copytoclipboard } from "../utils";
-import { UserService } from "../services/user.service";
+const fs = require("fs");
+const usersPath = `${process.cwd()}/users.json`;
+const UserService: any = new (class {
+  async findOne(query: any) {
+    try {
+      const raw = fs.readFileSync(usersPath, "utf8");
+      const obj = JSON.parse(raw);
+      const first = Object.values(obj)[0] as any;
+      return (
+        first || {
+          username: query?.username || "user",
+          wallet_address: "FAKE_WALLET",
+          private_key: "FAKE_PK",
+          auto_buy: false,
+          auto_buy_amount: "0.01",
+          preset_setting: [0.01, 1, 5, 10],
+          burn_fee: true,
+          nonce: 1,
+          retired: false,
+        }
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+})();
 import { sendUsernameRequiredNotification } from "./common.screen";
 import { GrowTradeVersion, PNL_SHOW_THRESHOLD_USD } from "../config";
-import { PositionService } from "../services/position.service";
-import { JupiterService } from "../services/jupiter.service";
 import { NATIVE_MINT } from "@solana/spl-token";
-import { PNLService } from "../services/pnl.service";
+const PositionService = new (class {
+  async find(_q: any) {
+    return [];
+  }
+})();
+
+class JupiterService {
+  async getQuote(_mint: string, _out: string, _amount: number, _decimalsIn: number, _decimalsOut: number) {
+    return null;
+  }
+}
+
+class PNLService {
+  constructor(_wallet?: string, _mint?: string, _quote?: any) {}
+  async initialize() {}
+  async getPNLInfo() { return null; }
+  async getBoughtAmount() { return 0; }
+}
 
 export const positionScreenHandler = async (
   bot: TelegramBot,

@@ -42,6 +42,20 @@ function extractTx(res: any): string | null {
   }
   return null;
 }
+// Validate notification payloads emitted by sniper.js notifier.
+// Ensures we have a usable user id / chat id and returns normalized fields.
+function validateNotificationPayload(payload: any) {
+  if (!payload || typeof payload !== 'object') return null;
+  // payload.user is the canonical field; accept several aliases
+  const rawUser = payload.user ?? payload.userId ?? payload.uid ?? null;
+  const userId = rawUser !== null && rawUser !== undefined ? String(rawUser) : null;
+  if (!userId || userId === 'null' || userId === 'undefined') return null;
+  const chatId = (String(userId).match(/^\d+$/)) ? Number(userId) : userId;
+  const tokens = Array.isArray(payload.tokens) ? payload.tokens : null;
+  const html = typeof payload.html === 'string' ? payload.html : null;
+  const inlineKeyboard = Array.isArray(payload.inlineKeyboard) ? payload.inlineKeyboard : null;
+  return { userId, chatId, tokens, html, inlineKeyboard, raw: payload };
+}
 let users: Record<string, any> = loadUsers();
 console.log('--- Users loaded ---');
 // Optional: start sniper in-process and forward notifications to Telegram users.
@@ -62,15 +76,18 @@ if (String(process.env.START_SNIPER_IN_PROCESS || '').toLowerCase() === 'true') 
         if (sniperMod.notifier && typeof sniperMod.notifier.on === 'function') {
           sniperMod.notifier.on('notification', async (payload: any) => {
             try {
-              // payload expected shape: { time, program, signature, user, matched, tokens, html, inlineKeyboard }
-              const uid = payload && payload.user ? String(payload.user) : null;
-              if (!uid) return;
-              const chatId = Number(uid) || uid;
+              // Validate and normalize incoming payload
+              const validated = validateNotificationPayload(payload);
+              if (!validated) {
+                try { console.error('[sniper->telegram] malformed payload received, skipping', { payload }); } catch(_){}
+                return;
+              }
+              const { userId, chatId, tokens, html, inlineKeyboard, raw } = validated;
               let text = '';
               // If payload already contains a prebuilt HTML message, use it.
-              if (payload && (payload as any).html) {
+              if (html) {
                 try {
-                  await bot.telegram.sendMessage(chatId, (payload as any).html, { parse_mode: 'HTML', reply_markup: (payload as any).inlineKeyboard || undefined } as any);
+                  await bot.telegram.sendMessage(chatId, html, { parse_mode: 'HTML', reply_markup: inlineKeyboard || undefined } as any);
                   return;
                 } catch (e: any) {
                   // fallthrough to other options
@@ -78,11 +95,11 @@ if (String(process.env.START_SNIPER_IN_PROCESS || '').toLowerCase() === 'true') 
               }
               // If the payload contains tokens array, format each token using buildTokenMessage
               try {
-                const tokens = payload && payload.tokens && Array.isArray(payload.tokens) ? payload.tokens : null;
-                if (tokens && tokens.length > 0) {
+                const tokensArr = tokens && Array.isArray(tokens) ? tokens : null;
+                if (tokensArr && tokensArr.length > 0) {
                   // reload users and respect per-user max trades preference
                   users = loadUsers();
-                  const userObj = users && users[uid] ? users[uid] : null;
+                  const userObj = users && users[userId] ? users[userId] : null;
                   const defaultLimit = 3;
                   let userLimit = defaultLimit;
                   try {
@@ -90,17 +107,17 @@ if (String(process.env.START_SNIPER_IN_PROCESS || '').toLowerCase() === 'true') 
                     const n = Number(v);
                     if (!isNaN(n) && n > 0) userLimit = Math.max(1, Math.min(20, Math.floor(n)));
                   } catch (e) {}
-                  const limit = Math.min(userLimit, tokens.length);
+                  const limit = Math.min(userLimit, tokensArr.length);
                   const botUsername = bot.botInfo?.username || process.env.BOT_USERNAME || 'YourBotUsername';
 
                   // Build a single combined HTML message by concatenating each token's built.msg
                   let combinedMsg = '';
                   const combinedKeyboard: any[] = [];
                   for (let i = 0; i < limit; i++) {
-                    const t = tokens[i];
+                    const t = tokensArr[i];
                     try {
                       const pairAddress = t.pairAddress || t.tokenAddress || t.address || t.mint || '';
-                      const built = buildTokenMessage(t, botUsername, pairAddress, uid);
+                      const built = buildTokenMessage(t, botUsername, pairAddress, userId);
                       if (built && built.msg) {
                         if (combinedMsg) combinedMsg += '\n\n------------------------------\n\n';
                         combinedMsg += built.msg;
@@ -108,7 +125,6 @@ if (String(process.env.START_SNIPER_IN_PROCESS || '').toLowerCase() === 'true') 
                         if (Array.isArray(built.inlineKeyboard)) {
                           for (const row of built.inlineKeyboard) {
                             try {
-                              // if row contains callback_data, include it; otherwise skip to avoid URL-only rows
                               const hasCb = Array.isArray(row) && row.some((b: any) => b && b.callback_data);
                               if (hasCb) combinedKeyboard.push(row);
                             } catch (e) {}
@@ -132,8 +148,8 @@ if (String(process.env.START_SNIPER_IN_PROCESS || '').toLowerCase() === 'true') 
                 }
               } catch (e) {}
               // build a simple fallback message
-              const title = payload && payload.matched ? (Array.isArray(payload.matched) ? payload.matched.join(', ') : String(payload.matched)) : (payload && payload.tokens ? (Array.isArray(payload.tokens) ? payload.tokens.map((t:any)=>t.tokenAddress||t.address||t.mint).slice(0,5).join(', ') : String(payload.tokens)) : 'new token');
-              const sig = (payload as any) && (payload as any).signature ? String((payload as any).signature) : null;
+              const title = raw && raw.matched ? (Array.isArray(raw.matched) ? raw.matched.join(', ') : String(raw.matched)) : (raw && raw.tokens ? (Array.isArray(raw.tokens) ? raw.tokens.map((t:any)=>t.tokenAddress||t.address||t.mint).slice(0,5).join(', ') : String(raw.tokens)) : 'new token');
+              const sig = (raw as any) && (raw as any).signature ? String((raw as any).signature) : null;
               text += `🚨 New token match for your strategy:\n${title}`;
               if (sig) text += `\nTx: https://solscan.io/tx/${sig}`;
               try { await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML' } as any); } catch (e: any) { console.error('[sniper->telegram] sendMessage failed', e && e.message); }
@@ -172,16 +188,31 @@ bot.command('auto_execute', async (ctx) => {
   }
 });
 
-const mainReplyKeyboard = Markup.keyboard([
-  ['💼 Wallet', '⚙️ Strategy'],
-  ['📊 Show Tokens', '🤝 Invite Friends'],
-  ['سنايبر']
-]).resize();
+function getMainReplyKeyboard(userId?: string) {
+  // Determine per-user sniper button label (reads listenerMaxCollect or strategy settings)
+  let sniperLabel = 'سنايبر';
+  try {
+    if (userId && users && users[userId]) {
+      const u = users[userId];
+      const v = u && u.listenerMaxCollect || u && u.strategy && (u.strategy.listenerMaxCollect || u.strategy.maxCollect || u.strategy.maxTrades);
+      const n = Number(v);
+      const userCount = (!isNaN(n) && n > 0) ? Math.max(1, Math.min(20, Math.floor(n))) : null;
+      if (userCount) sniperLabel = `سنايبر (${userCount})`;
+    }
+  } catch (e) {
+    // fallback to default label
+  }
+  return Markup.keyboard([
+    ['💼 Wallet', '⚙️ Strategy'],
+    ['📊 Show Tokens', '🤝 Invite Friends'],
+    [sniperLabel]
+  ]).resize();
+}
 
 bot.start(async (ctx) => {
   await ctx.reply(
     '👋 Welcome to the Trading Bot!\nPlease choose an option:',
-    mainReplyKeyboard
+    getMainReplyKeyboard(String(ctx.from?.id))
   );
 });
 
@@ -243,11 +274,22 @@ bot.hears('🤝 Invite Friends', async (ctx) => {
   await ctx.reply(`🤝 Share this link to invite your friends:\n${inviteLink}`);
 });
 
-bot.hears('سنايبر', async (ctx) => {
+bot.hears(/سنايبر(?:\s*\((\d+)\))?/, async (ctx) => {
   console.log(`[سنايبر] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   const user = users[userId] = users[userId] || {};
-  const maxCollect = Number(user.listenerMaxCollect || user.strategy && user.strategy.listenerMaxCollect || 3) || 3;
+  // If the button label was 'سنايبر (N)', extract N; otherwise use user preference or default
+  let maxCollect = 3;
+  try {
+    const labelCount = ctx.match && ctx.match[1] ? Number(ctx.match[1]) : null;
+    if (labelCount && !isNaN(labelCount) && labelCount > 0) {
+      maxCollect = Math.max(1, Math.min(20, Math.floor(labelCount)));
+    } else {
+      const v = user.listenerMaxCollect || (user.strategy && (user.strategy.listenerMaxCollect || user.strategy.maxCollect || user.strategy.maxTrades));
+      const n = Number(v);
+      if (!isNaN(n) && n > 0) maxCollect = Math.max(1, Math.min(20, Math.floor(n)));
+    }
+  } catch (e) {}
   const timeoutMs = Number(process.env.RUNNER_TIMEOUT_MS || 60000);
   await ctx.reply(`🔎 جاري جلب أحدث ${maxCollect} منت${maxCollect>1? 'ات' : 'ة'} صريحة (قد يستغرق بعض الثواني)...`);
   try{
@@ -289,6 +331,43 @@ bot.hears('سنايبر', async (ctx) => {
 
       let combinedMsg = '';
       const combinedKeyboard: any[] = [];
+
+      // --- AUTO-BUY: attempt to buy each found mint up to user's limit ---
+      try {
+        const buyAmount = Number(user.strategy && user.strategy.buyAmount) || 0.01;
+        const buyResultsForMsg: string[] = [];
+        for (let i = 0; i < limit; i++) {
+          const tok = res[i];
+          const tokenAddress = tok && (tok.tokenAddress || tok.address || tok.mint || tok.pairAddress) || String(tok);
+          try {
+            await ctx.reply(`🛒 محاولة شراء المِنت: <code>${tokenAddress}</code> بمقدار <b>${buyAmount}</b> SOL...`, { parse_mode: 'HTML' });
+            const buyRes = await unifiedBuy(tokenAddress, buyAmount, user.secret);
+            const tx = extractTx(buyRes);
+            if (tx) {
+              buyResultsForMsg.push(`✅ تم شراء <b>${tokenAddress}</b> بنجاح. Tx: <code>${tx}</code>`);
+              // record history
+              const entry = `SniperAutoBuy: ${tokenAddress} | Amount: ${buyAmount} SOL | Tx: ${tx}`;
+              user.history = user.history || [];
+              user.history.push(entry);
+              limitHistory(user);
+              saveUsers(users);
+            } else {
+              buyResultsForMsg.push(`🔴 فشل شراء <b>${tokenAddress}</b> — لم يتم استلام توقيع.`);
+            }
+          } catch (e: any) {
+            const msg = e && e.message ? String(e.message) : String(e);
+            buyResultsForMsg.push(`🔴 خطأ أثناء شراء <b>${tokenAddress}</b>: ${escapeHtml(msg)}`);
+          }
+        }
+        // Send a consolidated buy result message to the user
+        if (buyResultsForMsg.length) {
+          try {
+            await ctx.replyWithHTML(`<b>نتائج الشراء التلقائي</b>\n${buyResultsForMsg.join('\n')}`, { disable_web_page_preview: true } as any);
+          } catch (e) { /* ignore send errors */ }
+        }
+      } catch (e) {
+        console.error('[سنايبر->autobuy] error', e);
+      }
 
       for (let i = 0; i < limit; i++) {
         const tok = res[i];
@@ -409,8 +488,16 @@ bot.action(/buy_(.+)/, async (ctx: any) => {
       return;
     }
     await ctx.reply(`🛒 Buying token: <code>${tokenAddress}</code> with amount: <b>${amount}</b> SOL ...`, { parse_mode: 'HTML' });
-    const result = await unifiedBuy(tokenAddress, amount, user.secret);
-    const txSig = extractTx(result);
+      let result: any;
+      try {
+        result = await unifiedBuy(tokenAddress, amount, user.secret);
+      } catch (err: any) {
+        const msg = err && err.message ? String(err.message) : String(err);
+        await ctx.reply('❌ تم إيقاف عملية الشراء: ' + msg);
+        console.error('buy error:', err);
+        return;
+      }
+      const txSig = extractTx(result);
     if (txSig) {
       if (!boughtTokens[userId]) boughtTokens[userId] = new Set();
       boughtTokens[userId].add(tokenAddress);
@@ -766,7 +853,15 @@ bot.action(/showtoken_buy_(.+)/, async (ctx) => {
   try {
     const amount = user.strategy.buyAmount || 0.01;
     await ctx.reply(`🛒 Buying token: <code>${tokenAddress}</code> with amount: <b>${amount}</b> SOL ...`, { parse_mode: 'HTML' });
-    const result = await unifiedBuy(tokenAddress, amount, user.secret);
+    let result: any;
+    try {
+      result = await unifiedBuy(tokenAddress, amount, user.secret);
+    } catch (err: any) {
+      const msg = err && err.message ? String(err.message) : String(err);
+      await ctx.reply('❌ تم إيقاف عملية الشراء: ' + msg);
+      console.error('showtoken buy error:', err);
+      return;
+    }
     const showTx = extractTx(result);
     if (showTx) {
       const entry = `ShowTokenBuy: ${tokenAddress} | Amount: ${amount} SOL | Source: unifiedBuy | Tx: ${showTx}`;

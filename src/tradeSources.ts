@@ -15,7 +15,7 @@ type TradeSource = 'jupiter' | 'raydium' | 'dexscreener';
 const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
 import type { BlockhashWithExpiryBlockHeight } from '@solana/web3.js';
 const { createJupiterApiClient } = require('@jup-ag/api');
-import { transactionSenderAndConfirmationWaiter } from './utils/jupiter.transaction.sender';
+import { transactionSenderAndConfirmationWaiter, manualSendRawTransactionVerbose } from './utils/jupiter.transaction.sender';
 import { loadKeypair, withTimeout, logTrade } from './utils/tokenUtils';
 
 const Jupiter = {
@@ -83,17 +83,89 @@ const Jupiter = {
             keypair.publicKey,
             tokenMintPubkey
           );
-          const tx = new (require('@solana/web3.js').Transaction)().add(ataIx);
+          // Build transaction with explicit fee payer (required for compile/simulate)
+          const { Transaction, LAMPORTS_PER_SOL, PublicKey } = require('@solana/web3.js');
+          const tx = new Transaction({ feePayer: keypair.publicKey }).add(ataIx);
+
+          // Check rent-exempt lamports for ATA (approx 165 bytes) and estimated fee
+          let ataRent = 0;
+          try {
+            // associated token account size is the parsed account length for token accounts
+            const rentExemption = await connection.getMinimumBalanceForRentExemption(165);
+            ataRent = rentExemption;
+          } catch (e) {
+            console.warn('[Jupiter][buy] Failed to get rent exemption, proceeding conservatively');
+            ataRent = Math.ceil(0.002 * LAMPORTS_PER_SOL); // fallback ~0.002 SOL
+          }
+
+          // Estimate a single-signature fee (conservative)
+          const estimatedFee = Math.ceil(5000); // in lamports (very conservative placeholder)
+
+          // Ensure payer has enough lamports for rent + fee before attempting ATA creation
+          const payerBalance = await connection.getBalance(keypair.publicKey);
+          if (payerBalance < ataRent + estimatedFee) {
+            console.error(`[Jupiter][buy] Insufficient SOL for ATA creation. Required: ${(ataRent + estimatedFee) / LAMPORTS_PER_SOL} SOL, Available: ${payerBalance / LAMPORTS_PER_SOL} SOL`);
+            throw new Error(`Insufficient SOL to create ATA for mint ${tokenMint}. Skipping trade to avoid fees.`);
+          }
+
+          // Set recent blockhash and sign transaction before simulating to provide fee payer signature
+          try {
+            const latest = await connection.getLatestBlockhash('finalized');
+            tx.recentBlockhash = latest.blockhash;
+          } catch (e) {
+            // ignore and let simulateTransaction proceed; some RPCs don't require explicit blockhash
+          }
+          // Partially sign with payer so simulation sees a valid fee payer signature
+          try {
+            tx.sign(keypair);
+          } catch (e) {
+            // Transaction.sign may throw if the transaction has been compiled differently; ignore
+          }
+
           // Preflight simulation for ATA creation
           let ataSim = await connection.simulateTransaction(tx);
           if (ataSim.value.err) {
             console.error(`[Jupiter][buy] ATA creation simulation failed for mint ${tokenMint}:`, ataSim.value.err);
+            if (ataSim.value.logs) console.error('[Jupiter][buy] ATA simulation logs:\n', ataSim.value.logs.join('\n'));
             throw new Error(`ATA creation simulation failed for mint ${tokenMint}`);
           }
-          const sig = await connection.sendTransaction(tx, [keypair]);
-          console.log(`[Jupiter][buy] ATA creation tx sent: ${sig}`);
-          await connection.confirmTransaction(sig, 'confirmed');
-          console.log(`[Jupiter][buy] ATA creation confirmed.`);
+          // Send ATA creation transaction via centralized sender with limited retries so LIVE_TRADES is enforced there
+          const ataSerialized = tx.serialize();
+          let ataSent = false;
+          let lastAtaErr: any = null;
+          for (let attempt = 0; attempt < 2 && !ataSent; attempt++) {
+            try {
+              const blockhashWithExpiryBlockHeight = (await connection.getLatestBlockhashAndContext('confirmed')).value;
+              const ataResult = await transactionSenderAndConfirmationWaiter({
+                connection,
+                serializedTransaction: ataSerialized,
+                blockhashWithExpiryBlockHeight,
+              });
+              if (!ataResult) {
+                const liveTradesFlag = process.env.LIVE_TRADES === undefined ? true : (String(process.env.LIVE_TRADES).toLowerCase() === 'true');
+                if (!liveTradesFlag) {
+                  console.log('[Jupiter][buy] DRY-RUN: central sender returned null for ATA creation; marking ATA as created for simulation purposes.');
+                  ataSent = true;
+                  break;
+                }
+                lastAtaErr = new Error('[Jupiter][buy] ATA creation aborted by central sender (dry-run or expired)');
+                console.warn('[Jupiter][buy] ATA attempt', attempt, 'returned null result from sender');
+                // wait a short moment before retry
+                await new Promise(r => setTimeout(r, 1200));
+                continue;
+              }
+              console.log(`[Jupiter][buy] ATA creation result:`, ataResult.transaction?.signatures?.[0] || 'confirmed');
+              ataSent = true;
+            } catch (e) {
+              lastAtaErr = e;
+              console.warn('[Jupiter][buy] ATA create attempt', attempt, 'failed:', (e as any)?.message ?? e);
+              await new Promise(r => setTimeout(r, 1200));
+            }
+          }
+          if (!ataSent) {
+            console.error('[Jupiter][buy] All ATA creation attempts failed:', lastAtaErr);
+            throw lastAtaErr;
+          }
         }
         if (tokenBalance < 0) {
           throw new Error(`Insufficient token balance for mint ${tokenMint}`);
@@ -109,14 +181,15 @@ const Jupiter = {
     // 2. Get quote
     let quote;
     try {
+      const PRIOR_FEE = Number(process.env.PRIORITY_FEE_LAMPORTS) || 200000;
       quote = await jupiter.quoteGet({
         inputMint: SOL_MINT,
         outputMint: tokenMint,
         amount: Math.floor(amount * 1e9),
         slippageBps: 100,
-        prioritizationFeeLamports: 99999 // raise priority fee
+        prioritizationFeeLamports: PRIOR_FEE // raise priority fee (configurable)
       });
-      console.log(`[Jupiter][buy] Using prioritizationFeeLamports: 99999`);
+      console.log(`[Jupiter][buy] Using prioritizationFeeLamports: ${PRIOR_FEE}`);
       console.log('[Jupiter][buy] Quote:', quote);
     } catch (e) {
       console.error('[Jupiter][buy] Failed to get quote:', e);
@@ -144,24 +217,49 @@ const Jupiter = {
     if (!swapResp || !swapResp.swapTransaction) {
       throw new Error('Failed to get swap transaction from Jupiter');
     }
-    // 4. Sign and send transaction using robust sender
-    const swapTxBuf = Buffer.from(swapResp.swapTransaction, 'base64');
-    let txid = '';
-    let blockhashWithExpiryBlockHeight: BlockhashWithExpiryBlockHeight;
-    try {
+  // 4. Sign and send transaction using robust sender
+  let swapTxBuf = Buffer.from(swapResp.swapTransaction, 'base64');
+  let txid = '';
+  let blockhashWithExpiryBlockHeight: BlockhashWithExpiryBlockHeight;
+  try {
       // Try to get blockhash info from quote or connection
       blockhashWithExpiryBlockHeight = quote?.blockhashWithExpiryBlockHeight;
       if (!blockhashWithExpiryBlockHeight) {
         blockhashWithExpiryBlockHeight = (await connection.getLatestBlockhashAndContext('confirmed')).value;
       }
-      // Preflight simulation for swap transaction
-      const { VersionedTransaction } = require('@solana/web3.js');
+  // Preflight simulation for swap transaction
+      const { VersionedTransaction, Transaction } = require('@solana/web3.js');
       let swapSimError = null;
       try {
-        const txSim = await connection.simulateTransaction(new VersionedTransaction(swapTxBuf));
+        // Try parsing as a VersionedTransaction; if that fails, fallback to legacy Transaction
+        let txObj;
+        try {
+          // Deserialize the versioned transaction from bytes
+          txObj = VersionedTransaction.deserialize(swapTxBuf);
+        } catch (parseErr) {
+          try {
+            txObj = Transaction.from(swapTxBuf);
+          } catch (legacyErr) {
+            throw parseErr; // rethrow original if both fail
+          }
+        }
+
+        const txSim = await connection.simulateTransaction(txObj);
         if (txSim.value.err) {
           swapSimError = txSim.value.err;
-          console.error(`[Jupiter][buy] Swap simulation failed for mint ${tokenMint}:`, swapSimError);
+          try {
+            console.error(`[Jupiter][buy] Swap simulation failed for mint ${tokenMint}:`, JSON.stringify(txSim.value.err));
+          } catch (e) {
+            console.error(`[Jupiter][buy] Swap simulation failed for mint ${tokenMint}:`, txSim.value.err);
+          }
+          // Also print program logs to help diagnose InstructionError
+          if (txSim.value.logs) {
+            console.error(`[Jupiter][buy] Simulation logs for mint ${tokenMint}:\n`, txSim.value.logs.join('\n'));
+          }
+          // Log swapResp metadata if available
+          try {
+            console.error(`[Jupiter][buy] swapResp metadata: lastValidBlockHeight=${swapResp?.lastValidBlockHeight}, prioritizationFeeLamports=${swapResp?.prioritizationFeeLamports}`);
+          } catch (e) {}
         }
       } catch (e) {
         swapSimError = e;
@@ -170,14 +268,102 @@ const Jupiter = {
       if (swapSimError) {
         throw new Error(`Swap simulation failed for mint ${tokenMint}`);
       }
-      const txResult = await transactionSenderAndConfirmationWaiter({
-        connection,
-        serializedTransaction: swapTxBuf,
-        blockhashWithExpiryBlockHeight,
-      });
-      if (!txResult || !txResult.transaction) throw new Error('Transaction failed or not confirmed');
-      txid = txResult.transaction.signatures?.[0] || '';
-      console.log('[Jupiter][buy] Transaction sent:', txid);
+      // Try sending swap via centralized sender; if it fails, retry by re-quoting and re-requesting swap
+      let txResult = null;
+      let swapSent = false;
+      let lastSwapErr: any = null;
+      const MAX_SWAP_ATTEMPTS = 3;
+      for (let attempt = 0; attempt < MAX_SWAP_ATTEMPTS && !swapSent; attempt++) {
+        try {
+          console.log(`[Jupiter][buy] Re-simulating before sending attempt ${attempt + 1}/${MAX_SWAP_ATTEMPTS} for ${tokenMint}`);
+          // Re-parse and re-simulate to ensure tx is still valid
+          try {
+            let txObj;
+            try {
+              txObj = VersionedTransaction.deserialize(swapTxBuf);
+            } catch (parseErr) {
+              txObj = Transaction.from(swapTxBuf);
+            }
+            const simBefore = await connection.simulateTransaction(txObj);
+            if (simBefore.value.err) {
+              console.error('[Jupiter][buy] Pre-send simulation failed, aborting send attempt:', simBefore.value.err);
+              if (simBefore.value.logs) console.error(simBefore.value.logs.join('\n'));
+              throw new Error('Pre-send simulation failed');
+            }
+          } catch (simErr) {
+            throw simErr;
+          }
+
+          console.log(`[Jupiter][buy] Sending swap attempt ${attempt + 1}/${MAX_SWAP_ATTEMPTS} for ${tokenMint}`);
+          // request server-side preflight (skipPreflight=false) to avoid wasting fees on bad txs
+          txResult = await transactionSenderAndConfirmationWaiter({
+            connection,
+            serializedTransaction: swapTxBuf,
+            blockhashWithExpiryBlockHeight,
+            sendOptions: { skipPreflight: false },
+          });
+          if (!txResult) {
+            const liveTradesFlag = process.env.LIVE_TRADES === undefined ? true : (String(process.env.LIVE_TRADES).toLowerCase() === 'true');
+            if (!liveTradesFlag) {
+              console.log('[Jupiter][buy] DRY-RUN: central sender returned null for swap send; marking swap as simulated success.');
+              // In dry-run, mark as sent (no real txid)
+              txid = 'DRY-RUN-SIMULATED-TX';
+              swapSent = true;
+              break;
+            }
+            throw new Error('Transaction failed or not confirmed');
+          }
+          if (!txResult.transaction) throw new Error('Transaction failed or not confirmed');
+          txid = txResult.transaction.signatures?.[0] || '';
+          console.log('[Jupiter][buy] Transaction sent:', txid);
+          swapSent = true;
+          break;
+        } catch (e) {
+          lastSwapErr = e;
+          console.warn('[Jupiter][buy] swap send attempt', attempt + 1, 'failed:', (e as any)?.message ?? e);
+          // small backoff
+          await new Promise(r => setTimeout(r, 1500 + attempt * 500));
+          // refresh quote and swap transaction to get fresh blockhash / prioritization fee
+          try {
+            console.log('[Jupiter][buy] refreshing quote and swap request to retry');
+            const refreshedQuote = await jupiter.quoteGet({
+              inputMint: SOL_MINT,
+              outputMint: tokenMint,
+              amount: Math.floor(amount * 1e9),
+              slippageBps: 100,
+              prioritizationFeeLamports: Number(process.env.PRIORITY_FEE_LAMPORTS) || 200000,
+            });
+            const refreshedSwapResp = await jupiter.swapPost({ swapRequest: { userPublicKey, wrapAndUnwrapSol: true, asLegacyTransaction: false, quoteResponse: refreshedQuote } });
+            if (refreshedSwapResp && refreshedSwapResp.swapTransaction) {
+              swapTxBuf = Buffer.from(refreshedSwapResp.swapTransaction, 'base64');
+              blockhashWithExpiryBlockHeight = refreshedQuote?.blockhashWithExpiryBlockHeight || (await connection.getLatestBlockhashAndContext('confirmed')).value;
+              console.log('[Jupiter][buy] refreshed swap transaction ready for next attempt');
+            }
+          } catch (innerErr) {
+            console.warn('[Jupiter][buy] refreshing quote/swap failed:', (innerErr as any)?.message ?? innerErr);
+          }
+        }
+      }
+      if (!swapSent) {
+        console.error('[Jupiter][buy] All swap send attempts failed:', lastSwapErr);
+        // Fallback: attempt manual verbose send
+        try {
+          console.log('[Jupiter][buy] Falling back to manual verbose sendRawTransaction');
+          // Manual verbose send with server-side preflight to ensure RPC rejects bad txs instead of burning fees
+          const manual = await manualSendRawTransactionVerbose({ connection, serializedTransaction: swapTxBuf, sendOptions: { skipPreflight: false } });
+          if (manual && manual.success) {
+            txid = manual.txid || '';
+            console.log('[Jupiter][buy] Manual send succeeded:', txid);
+            swapSent = true;
+          } else {
+            console.error('[Jupiter][buy] Manual send failed or timed out:', manual);
+            throw lastSwapErr;
+          }
+        } catch (manErr) {
+          console.error('[Jupiter][buy] Manual verbose send failed as fallback:', manErr);
+          throw lastSwapErr;
+        }
+      }
     } catch (e) {
       console.error('[Jupiter][buy] Robust sender failed:', e);
       if (typeof e === 'object' && e !== null && 'message' in e && typeof (e as any).message === 'string' && (e as any).message.includes('429')) {
@@ -295,8 +481,46 @@ async function getRaydiumPrice(tokenMint: string, amount: number) {
     priceSol,
     source: 'raydium',
     buy: async (tokenMint: string, amount: number, payerKeypair: any) => {
-      // نفذ الشراء عبر Raydium (يجب أن تضيف منطق الشراء الفعلي)
-      return { tx: 'dummy-raydium-tx', price: priceUsd, signature: 'dummy-raydium-sign' };
+      try {
+        // Raydium service expects a private key in base58 (pk) and token params
+        const { RaydiumSwapService } = require('./raydium/raydium.service');
+        const bs58 = require('bs58');
+        // payerKeypair may be a Keypair object or base64 secret; normalize to base58 pk
+        let pk: string;
+        try {
+          if (typeof payerKeypair === 'string') {
+            // assume base64 secret
+            const buf = Buffer.from(payerKeypair, 'base64');
+            pk = bs58.encode(buf.slice(0, 32));
+          } else if (payerKeypair && payerKeypair.secretKey) {
+            pk = bs58.encode(Buffer.from(payerKeypair.secretKey));
+          } else if (Array.isArray(payerKeypair)) {
+            pk = bs58.encode(Buffer.from(payerKeypair));
+          } else {
+            // fallback: try JSON stringify -> parse
+            pk = bs58.encode(Buffer.from(JSON.stringify(payerKeypair)));
+          }
+        } catch (e) {
+          console.warn('[getRaydiumPrice][buy] Failed to normalize payerKeypair to bs58, attempting raw passthrough', e);
+          pk = payerKeypair as any;
+        }
+
+        // Arbitrary defaults: assume token decimals 9, slippage 100 (1%), gas fee small
+        const decimal = 9;
+        const slippage = 100; // Percent class in Raydium expects basis-like; service uses it directly
+        const gasFee = Number(process.env.RAYDIUM_GAS_FEE_SOL || '0.00001');
+        const isFeeBurn = false;
+        const username = process.env.RAYDIUM_USERNAME || 'bot';
+        const isToken2022 = false;
+
+        const svc = new RaydiumSwapService();
+        const res = await svc.swapToken(pk, /*inputMint*/ 'So11111111111111111111111111111111111111112', /*outputMint*/ tokenMint, decimal, amount, slippage, gasFee, isFeeBurn, username, isToken2022);
+        if (!res) throw new Error('Raydium swap returned null');
+        return { tx: res.bundleId || res.signature || res.tx || null, price: priceUsd, signature: res.signature || res.bundleId };
+      } catch (e) {
+        console.error('[getRaydiumPrice][buy] Raydium buy failed:', e);
+        throw e;
+      }
     }
   };
 }
@@ -389,13 +613,18 @@ export async function unifiedBuy(tokenMint: string, amount: number, payerKeypair
   // تنفيذ الشراء من المصدر الأفضل
   const buyResult = await best.buy(tokenMint, amount, payerKeypair);
 
-  // إرجاع بيانات الشراء كاملة
-  return {
+  // Normalize result shape for callers: always return { tx, source, success, raw, priceUsd, priceSol }
+  const br: any = buyResult;
+  const tx = br && (br.tx || br.txSignature || br.signature || (br.buyResult && (br.buyResult.tx || br.buyResult.signature))) || null;
+  const normalized = {
+    tx,
     source: best.source,
+    success: !!tx,
+    raw: buyResult,
     priceUsd: best.priceUsd,
-    priceSol: best.priceSol,
-    buyResult
+    priceSol: best.priceSol
   };
+  return normalized;
 }
 
 /**
@@ -404,8 +633,17 @@ export async function unifiedBuy(tokenMint: string, amount: number, payerKeypair
  * @param {string} secret
  * @returns {Promise<{tx: string, source: TradeSource}>}
  */
-async function unifiedSell(tokenMint: string, amount: number, secret: string): Promise<{tx: string, source: TradeSource}> {
-  return raceSources(SELL_SOURCES, 'sell', tokenMint, amount, secret);
+async function unifiedSell(tokenMint: string, amount: number, secret: string) {
+  // raceSources returns an object with txSignature/tx etc. Normalize similarly to unifiedBuy
+  const res = await raceSources(SELL_SOURCES, 'sell', tokenMint, amount, secret);
+  const r: any = res;
+  const tx = r && (r.tx || r.txSignature || r.signature) || null;
+  return {
+    tx,
+    source: r && (r.source || r.name) || 'unknown',
+    success: !!tx,
+    raw: r
+  };
 }
 
 export { unifiedSell };

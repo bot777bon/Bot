@@ -120,9 +120,13 @@ export async function formatAmmKeys(
     );
     for (const itemLTA of ltas) {
       const keyStr = itemLTA.pubkey.toString();
+      const ltaData =
+        typeof Buffer !== "undefined" && Buffer.isBuffer(itemLTA.account.data)
+          ? new Uint8Array(itemLTA.account.data)
+          : (itemLTA.account.data as unknown as Uint8Array);
       const ltaForamt = new AddressLookupTableAccount({
         key: itemLTA.pubkey,
-        state: AddressLookupTableAccount.deserialize(itemLTA.account.data),
+        state: AddressLookupTableAccount.deserialize(ltaData),
       });
       for (const itemKey of ltaForamt.state.addresses) {
         const itemKeyStr = itemKey.toString();

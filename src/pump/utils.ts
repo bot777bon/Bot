@@ -65,7 +65,8 @@ export async function sendAndConfirmTransactionWrapper(
 }
 
 export function bufferFromUInt64(value: number | string) {
-  let buffer = Buffer.alloc(8);
+  // Create a Buffer for ease of writing then return a Uint8Array to satisfy Web3 types
+  const buffer = Buffer.alloc(8);
   buffer.writeBigUInt64LE(BigInt(value));
-  return buffer;
+  return new Uint8Array(buffer);
 }

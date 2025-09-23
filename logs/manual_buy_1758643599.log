@@ -1,0 +1,59 @@
+Attempting manual buy: user=5766632997 mint=4KUCN58TeExp9qrap64yuBPTmGmToV7R9h1p7HCZpump amount=0.01 SOL
+[Jupiter][buy] Using RPC: https://api.mainnet-beta.solana.com
+[Jupiter][buy] PublicKey: o6E7shrk7G38yFcaK1VrQHwBDJJGPnQezsznYMdktUf
+[Jupiter][buy] SOL balance: 0.106705308 SOL
+[Jupiter][buy] Token balance for 4KUCN58TeExp9qrap64yuBPTmGmToV7R9h1p7HCZpump: 0
+[Jupiter][buy] Creating associated token account for mint: 4KUCN58TeExp9qrap64yuBPTmGmToV7R9h1p7HCZpump
+[Jupiter][buy] ATA creation result: 61rZU9p15VS4kLD6xqPdXgYQxmrZtdTh6UgxN8R6cqsgFsM7wbs9hbgN8eYE2qRWB4jvBNuFRyH6P2UbP4m1j7sL
+[Jupiter][buy] Using prioritizationFeeLamports: 200000
+[Jupiter][buy] Quote: {
+  inputMint: 'So11111111111111111111111111111111111111112',
+  inAmount: '10000000',
+  outputMint: '4KUCN58TeExp9qrap64yuBPTmGmToV7R9h1p7HCZpump',
+  outAmount: '14551707189',
+  otherAmountThreshold: '14406190118',
+  swapMode: 'ExactIn',
+  slippageBps: 100,
+  platformFee: undefined,
+  priceImpactPct: '0.0047227019632148932859449983',
+  routePlan: [ { swapInfo: [Object], percent: 100 } ],
+  contextSlot: 368764750,
+  timeTaken: 0.000503848
+}
+[Jupiter][buy] swapRequest: {
+  userPublicKey: 'o6E7shrk7G38yFcaK1VrQHwBDJJGPnQezsznYMdktUf',
+  wrapAndUnwrapSol: true,
+  asLegacyTransaction: false,
+  quoteResponse: {
+    inputMint: 'So11111111111111111111111111111111111111112',
+    inAmount: '10000000',
+    outputMint: '4KUCN58TeExp9qrap64yuBPTmGmToV7R9h1p7HCZpump',
+    outAmount: '14551707189',
+    otherAmountThreshold: '14406190118',
+    swapMode: 'ExactIn',
+    slippageBps: 100,
+    platformFee: undefined,
+    priceImpactPct: '0.0047227019632148932859449983',
+    routePlan: [ [Object] ],
+    contextSlot: 368764750,
+    timeTaken: 0.000503848
+  }
+}
+[Jupiter][buy] swapResp: {
+  swapTransaction: 'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAQAPGQvOoGD3e2mIgJ18lOUeZKrc7IAvvECX0/HcLVito1MoAcgh86jwj++I3DFCSnaAroyWgXBM8eX1yI4nmbf5giEtgDddlwZ6QY0W57jAs8DyyzGP3TMRDruI7xSUbOoAhTLL1NQNeePKG97mjiFYG+mmX5YxzlNGMCN85shhHpxUP7WcE0XD+Ayu4d26g5uqZpZySFGDzTlPQdxQgSHoXBOUcVubfUusjo2W4Oi3OCPUL3tLfAfSxZpqbje22LO1FKPXuxJ+WK3BLKaPg0N+wuHD+YIN6T5Y+ReKKRjdqve0vPwCLNcLUx56zr9BOJCjPT/T7f8zo2i5RTeqHm2mNh3v8fLPrNX/Qsmfut2lmKt64YxZQ8iUlh7dOrcgE7GAkvZL8fL/NMAhzgXUJ/y4XtR+tKxSKo7dsQBsbtbVIrE/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADBkZv5SEXMv/srbpyw5vnvIzlu8X3EmssQ5s6QAAAAAR51VvyMcBu7nTFbs5oFQf9sbLeo/SOUQKxzaJWvBOPBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAEG3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8AqQwU3vyCXsZ2lCUIGLtlQGX0KY0xVtVxtNT4CQwY6ahjDDX/qQVajlaNqPe8B1YVJ0zxySykH0AAnFFqpBTCfHAxTkQPylxjNf37OJUg3oxzC2A9s0ZH1A5p+Wn59Hekr0Ekbsx9eP6B5BdzpGllQZk3kjoHZEeX328+tRRCYBDLiQumRP4fVaoZ8RzS0uwU0yM7bgpL6u73K2mFjiHhcNaMlyWPTiSJ8bs9ECkUjg2DC1oTmdr/EIQEjnvY2+n4WaKD5cU1B9VeiwzmChRpRaarUI/ehbzHblfals9Ty9DjtD/6J/XX9kp0wJsfKVh53ksJqzbfyd1RSzIap7OM5ejXqo+wYNgpG0xNR12v92LJa9wNrOs2wBLq0S7TqUhBYeVKcJUog59hwLm4YHmJHBOSFuR6cbYvtzvschaUWHRe2/U9KV/SRrgkaV7kWnT6iNoDMzKSf2unEFgmX5/sbAAHCwAFAsBcFQALAAkDBBcBAAAAAAAUBgAIAA0KDgEBCgIACAwCAAAAgJaYAAAAAAAOAQgBEQwiDgAIAwwRDBYMDwUAExENAwgCBBcBDg4KFBgPCRUGBxIQACPlF8uXeuOtKgEAAABjZAABgJaYAAAAAAA1blljAwAAAGQAAA4DCAAAAQkA',
+  lastValidBlockHeight: 346935966,
+  prioritizationFeeLamports: 99999
+}
+[Jupiter][buy] Re-simulating before sending attempt 1/3 for 4KUCN58TeExp9qrap64yuBPTmGmToV7R9h1p7HCZpump
+[Jupiter][buy] Sending swap attempt 1/3 for 4KUCN58TeExp9qrap64yuBPTmGmToV7R9h1p7HCZpump
+[Jupiter][buy] refreshing quote and swap request to retry
+[Jupiter][buy] Re-simulating before sending attempt 2/3 for 4KUCN58TeExp9qrap64yuBPTmGmToV7R9h1p7HCZpump
+[Jupiter][buy] Sending swap attempt 2/3 for 4KUCN58TeExp9qrap64yuBPTmGmToV7R9h1p7HCZpump
+[Jupiter][buy] refreshing quote and swap request to retry
+[Jupiter][buy] refreshed swap transaction ready for next attempt
+[Jupiter][buy] Re-simulating before sending attempt 3/3 for 4KUCN58TeExp9qrap64yuBPTmGmToV7R9h1p7HCZpump
+[Jupiter][buy] Sending swap attempt 3/3 for 4KUCN58TeExp9qrap64yuBPTmGmToV7R9h1p7HCZpump
+[Jupiter][buy] refreshing quote and swap request to retry
+[Jupiter][buy] refreshed swap transaction ready for next attempt
+[Jupiter][buy] Falling back to manual verbose sendRawTransaction
+[manualSendRawTransactionVerbose] broadcasting raw transaction with options: { skipPreflight: false }

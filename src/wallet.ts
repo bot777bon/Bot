@@ -35,7 +35,8 @@ export function parseKey(input: string): any {
   } catch {}
   throw new Error('Invalid key format. Supported: base58, base64, hex, mnemonic, JSON array.');
 }
-import { Keypair, Connection, clusterApiUrl } from '@solana/web3.js';
+import { Keypair, clusterApiUrl } from '@solana/web3.js';
+import rpcPool from './utils/rpcPool';
 
 // Load a keypair from an array, Uint8Array, or base64/JSON string
 export function loadKeypair(secret: number[] | Uint8Array | string) {
@@ -70,7 +71,6 @@ export function exportSecretKey(keypair: any): string {
 
 // Create a Solana connection (Mainnet or Devnet)
 export function getConnection() {
-  const network = process.env.NETWORK === 'devnet' ? 'devnet' : 'mainnet-beta';
-  const rpcUrl = process.env.HELIUS_RPC_URL || process.env.RPC_URL || clusterApiUrl(network);
-  return new Connection(rpcUrl, 'confirmed');
+  // Prefer centralized RPC connection from rpcPool which applies rotation and backoff
+  return rpcPool.getRpcConnection();
 }

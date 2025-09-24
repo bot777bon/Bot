@@ -1,4 +1,5 @@
 import { Connection } from "@solana/web3.js";
+import rpcPool from './utils/rpcPool';
 
 // Centralized config used by src/ files. Values fall back to reasonable defaults
 // and can be overridden via environment variables.
@@ -50,8 +51,11 @@ export const JitoFeeEnum = {
 
 // Export pre-built Connection instances for convenience. Some modules expect both
 // a public connection and a private_connection for privileged calls.
-export const connection = new Connection(RPC_URL, COMMITMENT_LEVEL as any);
-export const private_connection = new Connection(PRIVATE_RPC_ENDPOINT, COMMITMENT_LEVEL as any);
+// Use rpcPool to obtain connections so the app benefits from rotation/backoff
+export const connection = rpcPool.getRpcConnection(RPC_URL);
+export const private_connection = rpcPool.getRpcConnection(PRIVATE_RPC_ENDPOINT || RPC_URL);
+
+export const getRpcPool = () => rpcPool;
 
 // Keep default export minimal (not required) but helpful for CommonJS consumers
 export default {
@@ -68,4 +72,5 @@ export default {
 	PNL_SHOW_THRESHOLD_USD,
 	connection,
 	private_connection,
+	getRpcPool,
 };

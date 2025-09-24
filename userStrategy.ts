@@ -1,9 +1,10 @@
-import { Connection, PublicKey } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
+import rpcPool from './src/utils/rpcPool';
 /**
  * Fetch the user's Solana balance
  */
 export async function getSolBalance(userSecret: string): Promise<number> {
-  const connection = new Connection('https://api.mainnet-beta.solana.com');
+  const connection = rpcPool.getRpcConnection();
   const secretKey = Uint8Array.from(Buffer.from(userSecret, 'base64'));
   const keypair = require('@solana/web3.js').Keypair.fromSecretKey(secretKey);
   const balance = await connection.getBalance(keypair.publicKey);

@@ -92,7 +92,9 @@ const SIG_BATCH_LIMIT = Number(process.env.SIG_BATCH_LIMIT) || 20;
 const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 8;
 // Freshness and first-signature matching configuration
 // Proposal 1: widen default window slightly to capture marginally delayed mints
-const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 2; // seconds
+// Increase sensible defaults so collector is less likely to reject near-edge mints
+// Proposal1: widen the age/window tolerances so marginally-delayed mints are accepted
+const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 30; // seconds
 // Collector: allow accumulating a small number of freshly-accepted mints and
 // printing them as a single JSON array. Useful for short-lived runs/testing.
 const COLLECT_MAX = Number(process.env.COLLECT_MAX) || 3;
@@ -114,7 +116,7 @@ function computeFirstSigTTL(){
     return Math.max(1000, Math.floor(base * multiplier));
   }catch(e){ return FIRST_SIG_TTL_MS; }
 }
-const FIRST_SIG_MATCH_WINDOW_SECS = Number(process.env.FIRST_SIG_MATCH_WINDOW_SECS) || 3; // allowed delta between firstSig.blockTime and tx.blockTime
+const FIRST_SIG_MATCH_WINDOW_SECS = Number(process.env.FIRST_SIG_MATCH_WINDOW_SECS) || 12; // allowed delta between firstSig.blockTime and tx.blockTime
 const FIRST_SIG_CACHE = new Map(); // mint -> { sig, blockTime, ts }
 
 async function getFirstSignatureCached(mint){
@@ -436,13 +438,18 @@ async function startSequentialListener(options){
                     const first = await getFirstSignatureCached(m);
                     if(first && first.sig && first.sig === sig){
                       const ft = first.blockTime || null;
+                      // compute a canonical age in seconds using firstSig or txBlock
+                      const canonicalAge = getCanonicalAgeSeconds(ft, txBlock);
                       if(ft && txBlock){
                         const delta = Math.abs(Number(ft) - Number(txBlock));
-                        // If the first-signature matches and timing is close, accept the mint as a candidate
-                        // and defer strict age-based decisions to per-user strategy filters (user.strategy.minAge).
-                        if(delta <= FIRST_SIG_MATCH_WINDOW_SECS){
+                        // Accept when first-signature matches and timing is reasonably close
+                        // AND the canonical age is within MAX_MINT_AGE_SECS to avoid accepting old tokens.
+                        if(delta <= FIRST_SIG_MATCH_WINDOW_SECS && (canonicalAge !== null && canonicalAge <= MAX_MINT_AGE_SECS)){
                           accept = true;
                         }
+                      } else if(canonicalAge !== null && canonicalAge <= MAX_MINT_AGE_SECS){
+                        // If only canonicalAge is available (no txBlock), still accept when it's within threshold
+                        accept = true;
                       }
                     }
                   }catch(e){ /* ignore */ }

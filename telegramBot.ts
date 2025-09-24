@@ -42,6 +42,18 @@ function extractTx(res: any): string | null {
   }
   return null;
 }
+// Detect dry-run / simulated buy sentinel so we don't report it as a real on-chain success
+function isSimulatedBuy(res: any): boolean {
+  if (!res) return false;
+  try {
+    // Common sentinel used in tradeSources: 'DRY-RUN-SIMULATED-TX'
+    const tx = (typeof res === 'string') ? res : (res.tx || (res.buyResult && res.buyResult.tx) || null);
+    if (tx && String(tx) === 'DRY-RUN-SIMULATED-TX') return true;
+    // Also accept explicit simulated flag
+    if (res.simulated === true || res.simulated === 'true') return true;
+  } catch (e) {}
+  return false;
+}
 // Validate notification payloads emitted by sniper.js notifier.
 // Ensures we have a usable user id / chat id and returns normalized fields.
 function validateNotificationPayload(payload: any) {
@@ -332,7 +344,7 @@ bot.hears(/سنايبر(?:\s*\((\d+)\))?/, async (ctx) => {
       let combinedMsg = '';
       const combinedKeyboard: any[] = [];
 
-      // --- AUTO-BUY: attempt to buy each found mint up to user's limit ---
+      // --- AUTO-BUY: run simulate-only per mint; immediate live buy occurs inside autoExecuteStrategyForUser if enabled and safe ---
       try {
         const buyAmount = Number(user.strategy && user.strategy.buyAmount) || 0.01;
         const buyResultsForMsg: string[] = [];
@@ -340,26 +352,52 @@ bot.hears(/سنايبر(?:\s*\((\d+)\))?/, async (ctx) => {
           const tok = res[i];
           const tokenAddress = tok && (tok.tokenAddress || tok.address || tok.mint || tok.pairAddress) || String(tok);
           try {
-            await ctx.reply(`🛒 محاولة شراء المِنت: <code>${tokenAddress}</code> بمقدار <b>${buyAmount}</b> SOL...`, { parse_mode: 'HTML' });
-            const buyRes = await unifiedBuy(tokenAddress, buyAmount, user.secret);
-            const tx = extractTx(buyRes);
-            if (tx) {
-              buyResultsForMsg.push(`✅ تم شراء <b>${tokenAddress}</b> بنجاح. Tx: <code>${tx}</code>`);
-              // record history
-              const entry = `SniperAutoBuy: ${tokenAddress} | Amount: ${buyAmount} SOL | Tx: ${tx}`;
-              user.history = user.history || [];
-              user.history.push(entry);
-              limitHistory(user);
-              saveUsers(users);
+            await ctx.reply(`� إجراء محاكاة لمنت: <code>${tokenAddress}</code> بمقدار <b>${buyAmount}</b> SOL...`, { parse_mode: 'HTML' });
+            const tokenObj = { mint: tokenAddress, createdAt: tok.firstBlockTime || tok.firstBlock || null, __listenerCollected: true };
+            const simRes = await autoExecuteStrategyForUser(user, [tokenObj], 'buy', { simulateOnly: true, listenerBypass: true });
+            const r = Array.isArray(simRes) && simRes.length > 0 ? simRes[0] : null;
+            if (!r) {
+              buyResultsForMsg.push(`🔴 فشل المحاكاة لمنت <b>${tokenAddress}</b> — لم تتوفر نتيجة.`);
+              continue;
+            }
+            if (r.immediateLive) {
+              const tx = extractTx(r.result);
+              if (tx) {
+                buyResultsForMsg.push(`✅ تم شراء <b>${tokenAddress}</b> بنجاح بعد المحاكاة. Tx: <code>${tx}</code>`);
+                try {
+                  const entry = `SniperAutoBuy: ${tokenAddress} | Amount: ${buyAmount} SOL | Tx: ${tx}`;
+                  user.history = user.history || [];
+                  user.history.push(entry);
+                  limitHistory(user);
+                  saveUsers(users);
+                } catch (e) { /* non-fatal */ }
+              } else {
+                buyResultsForMsg.push(`⚠️ تم تنفيذ محاولة شراء حيّ بعد المحاكاة لكن لم يتم استلام TxID لمنت <b>${tokenAddress}</b>.`);
+              }
             } else {
-              buyResultsForMsg.push(`🔴 فشل شراء <b>${tokenAddress}</b> — لم يتم استلام توقيع.`);
+              const simulated = r.simulated === true || isSimulatedBuy(r.result);
+              if (simulated) {
+                buyResultsForMsg.push(`⚠️ [محاكاة] المحاكاة نجحت لمنت <b>${tokenAddress}</b> — لم يتم بث المعاملة.`);
+                if (r.liveError) buyResultsForMsg.push(`ℹ️ ملاحظة: محاولة البث الفوري فشلت: ${escapeHtml(String(r.liveError))}`);
+              } else if (r.result && r.result.tx) {
+                const tx = extractTx(r.result);
+                buyResultsForMsg.push(`✅ تم شراء <b>${tokenAddress}</b> بنجاح. Tx: <code>${tx}</code>`);
+                try {
+                  const entry = `SniperAutoBuy: ${tokenAddress} | Amount: ${buyAmount} SOL | Tx: ${tx}`;
+                  user.history = user.history || [];
+                  user.history.push(entry);
+                  limitHistory(user);
+                  saveUsers(users);
+                } catch (e) { /* non-fatal */ }
+              } else {
+                buyResultsForMsg.push(`🔴 فشل شراء <b>${tokenAddress}</b> — لا نتيجة من المحاكاة.`);
+              }
             }
           } catch (e: any) {
             const msg = e && e.message ? String(e.message) : String(e);
-            buyResultsForMsg.push(`🔴 خطأ أثناء شراء <b>${tokenAddress}</b>: ${escapeHtml(msg)}`);
+            buyResultsForMsg.push(`🔴 خطأ أثناء محاكاة/شراء <b>${tokenAddress}</b>: ${escapeHtml(msg)}`);
           }
         }
-        // Send a consolidated buy result message to the user
         if (buyResultsForMsg.length) {
           try {
             await ctx.replyWithHTML(`<b>نتائج الشراء التلقائي</b>\n${buyResultsForMsg.join('\n')}`, { disable_web_page_preview: true } as any);

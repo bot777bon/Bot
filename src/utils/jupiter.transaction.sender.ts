@@ -6,6 +6,7 @@ import {
 } from "@solana/web3.js";
 import promiseRetry from "promise-retry";
 import { wait } from "./wait";
+import * as rpcPool from './rpcPool';
 
 function getRpcUrlCandidates(): string[] {
   const env = process.env;
@@ -47,6 +48,7 @@ export async function transactionSenderAndConfirmationWaiter({
 }: TransactionSenderAndConfirmationWaiterArgs): Promise<VersionedTransactionResponse | null> {
   // Default to live trades enabled unless explicitly set to 'false'
   const liveTrades = process.env.LIVE_TRADES === undefined ? true : (String(process.env.LIVE_TRADES).toLowerCase() === 'true');
+  console.log('[transactionSenderAndConfirmationWaiter] liveTrades flag at entry =', liveTrades);
   if (!liveTrades) {
     console.warn('[transactionSenderAndConfirmationWaiter] DRY-RUN: LIVE_TRADES!=true. Skipping sendRawTransaction to avoid burning fees.');
     return null;
@@ -62,55 +64,129 @@ export async function transactionSenderAndConfirmationWaiter({
     // Print diagnostics for first error
     try {
       if (firstErr && typeof firstErr === 'object') {
+        // Safely attempt to call getLogs() if available. getLogs() may itself throw or return
+        // a rejected promise when the internal connection is unavailable; handle that.
         if ('getLogs' in firstErr && typeof firstErr.getLogs === 'function') {
           try {
-            const logs = await firstErr.getLogs();
+            const logs = await Promise.resolve(firstErr.getLogs());
             console.error('[transactionSenderAndConfirmationWaiter] SendTransactionError getLogs():', logs);
           } catch (glErr) {
-            console.error('[transactionSenderAndConfirmationWaiter] getLogs() threw:', glErr);
+            // getLogs failed; attempt to surface transactionLogs if present (it may be a Promise)
+            console.error('[transactionSenderAndConfirmationWaiter] getLogs() threw:', (glErr as any)?.message ?? String(glErr));
+            // If the error contains a signature and we have a connection, try to fetch the transaction directly
+            try {
+              const sig = (firstErr && (firstErr.signature || firstErr.txSignature || firstErr.transactionSignature)) ? (firstErr.signature || firstErr.txSignature || firstErr.transactionSignature) : null;
+              if (sig && connection && typeof connection.getTransaction === 'function') {
+                try {
+                  const tx = await connection.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 } as any);
+                  console.error('[transactionSenderAndConfirmationWaiter] getTransaction fallback logs:', tx && (tx.meta && tx.meta.logMessages ? tx.meta.logMessages : tx));
+                } catch (getTxErr) {
+                  console.error('[transactionSenderAndConfirmationWaiter] getTransaction fallback failed:', (getTxErr as any)?.message ?? String(getTxErr));
+                }
+              }
+            } catch (_) {}
+            if ('transactionLogs' in firstErr && firstErr.transactionLogs) {
+              try {
+                const resolved = await Promise.resolve(firstErr.transactionLogs);
+                console.error('[transactionSenderAndConfirmationWaiter] error.transactionLogs (resolved):', resolved);
+              } catch (tErr) {
+                console.error('[transactionSenderAndConfirmationWaiter] error.transactionLogs (rejected):', (tErr as any)?.message ?? String(tErr));
+              }
+            }
+          }
+        } else if ('transactionLogs' in firstErr && firstErr.transactionLogs) {
+          try {
+            const resolved = await Promise.resolve(firstErr.transactionLogs);
+            console.error('[transactionSenderAndConfirmationWaiter] error.transactionLogs:', resolved);
+          } catch (tErr) {
+            console.error('[transactionSenderAndConfirmationWaiter] error.transactionLogs (rejected):', (tErr as any)?.message ?? String(tErr));
           }
         }
-        if ('transactionLogs' in firstErr && firstErr.transactionLogs) {
-          console.error('[transactionSenderAndConfirmationWaiter] error.transactionLogs:', firstErr.transactionLogs);
-        }
         if ('message' in firstErr) console.error('[transactionSenderAndConfirmationWaiter] sendRawTransaction error message:', firstErr.message);
-        console.error('[transactionSenderAndConfirmationWaiter] first sendRawTransaction error object:', JSON.stringify(firstErr, Object.getOwnPropertyNames(firstErr), 2));
+        // Print stack if available for better diagnostics
+        try {
+          if (firstErr && firstErr.stack) console.error('[transactionSenderAndConfirmationWaiter] firstErr.stack:', firstErr.stack);
+        } catch (_) {}
+        try {
+          console.error('[transactionSenderAndConfirmationWaiter] first sendRawTransaction error object:', JSON.stringify(firstErr, Object.getOwnPropertyNames(firstErr), 2));
+        } catch (jsErr) {
+          console.error('[transactionSenderAndConfirmationWaiter] first sendRawTransaction error (non-serializable):', firstErr);
+        }
       }
     } catch (diagErr) {
       console.error('[transactionSenderAndConfirmationWaiter] error while printing diagnostics for firstErr:', diagErr);
     }
 
-    // Try fallback RPC URLs in order
-    const candidates = getRpcUrlCandidates();
-    console.warn('[transactionSenderAndConfirmationWaiter] Attempting fallback RPCs, candidates:', candidates);
-    for (const url of candidates) {
+      // Try fallback RPCs from rpcPool (prefer healthy candidates)
+  const candidates = (rpcPool as any).getHealthyCandidates ? (rpcPool as any).getHealthyCandidates() : rpcPool.getRpcCandidates();
+      console.warn('[transactionSenderAndConfirmationWaiter] Attempting fallback RPCs from rpcPool, candidates:', candidates);
       try {
-        if (!url) continue;
-        console.log(`[transactionSenderAndConfirmationWaiter] trying RPC: ${url}`);
-        const altConn = new (require('@solana/web3.js').Connection)(url, 'confirmed');
-        txid = await altConn.sendRawTransaction(serializedTransaction, options);
-        // if succeeded, replace connection reference for subsequent confirmation steps
-        connection = altConn;
-        console.log('[transactionSenderAndConfirmationWaiter] sendRawTransaction succeeded via fallback RPC:', url, 'txid=', txid);
-        break;
-      } catch (e: any) {
-        console.warn(`[transactionSenderAndConfirmationWaiter] sendRawTransaction failed on ${url}:`, (e && e.message) || e);
-        // try next
-        try {
-          if (e && typeof e === 'object') {
-            if ('getLogs' in e && typeof e.getLogs === 'function') {
-              try { const logs = await e.getLogs(); console.error('[transactionSenderAndConfirmationWaiter] fallback getLogs():', logs); } catch(_){}
-            }
-            if ('transactionLogs' in e && e.transactionLogs) console.error('[transactionSenderAndConfirmationWaiter] fallback error.transactionLogs:', e.transactionLogs);
+        // print any last failure reasons recorded in rpcPool for diagnostics
+        const reasons: Record<string,string|null> = {};
+        if ((rpcPool as any).getLastFailureReason) {
+          for (const c of candidates) {
+            try { reasons[c] = (rpcPool as any).getLastFailureReason(c) || null; } catch (_) { reasons[c] = null; }
           }
-        } catch (_) {}
+          console.warn('[transactionSenderAndConfirmationWaiter] rpcPool lastFailureReason map:', reasons);
+        }
+      } catch (_) {}
+      for (let i = 0; i < candidates.length; i++) {
+        const url = candidates[i];
+        try {
+          if (!url) continue;
+          console.log(`[transactionSenderAndConfirmationWaiter] trying RPC from pool: ${url}`);
+          const altConn = rpcPool.getRpcConnection(url);
+          try {
+            txid = await altConn.sendRawTransaction(serializedTransaction, options);
+          } catch (sendErr) {
+            // mark failure and rethrow to outer catch for logging
+            const reason = (sendErr && (sendErr as any).message) ? (sendErr as any).message : String(sendErr);
+            if ((rpcPool as any).markFailureWithReason) (rpcPool as any).markFailureWithReason(url, reason);
+            else rpcPool.markFailure(url);
+            // If rate-limited, wait a bit before next candidate to reduce thrashing
+            try {
+              if (String(reason).toLowerCase().includes('429') || String(reason).toLowerCase().includes('too many')) {
+                await wait(500);
+              }
+            } catch (_) {}
+            throw sendErr;
+          }
+          // success: mark success, swap connection reference and break
+          rpcPool.markSuccess(url);
+          connection = altConn;
+          console.log('[transactionSenderAndConfirmationWaiter] sendRawTransaction succeeded via pool RPC:', url, 'txid=', txid);
+          break;
+        } catch (e: any) {
+          console.warn(`[transactionSenderAndConfirmationWaiter] sendRawTransaction failed on ${url}:`, (e && e.message) || e);
+          // attempt to log logs/transactionLogs if present (best-effort)
+          try {
+            if (e && typeof e === 'object') {
+              if ('getLogs' in e && typeof e.getLogs === 'function') {
+                try {
+                  const logs = await Promise.resolve(e.getLogs());
+                  console.error('[transactionSenderAndConfirmationWaiter] fallback getLogs():', logs);
+                } catch (glErr) {
+                  console.error('[transactionSenderAndConfirmationWaiter] fallback getLogs() threw:', (glErr as any)?.message ?? String(glErr));
+                }
+              } else if ('transactionLogs' in e && e.transactionLogs) {
+                try {
+                  const resolved = await Promise.resolve(e.transactionLogs);
+                  console.error('[transactionSenderAndConfirmationWaiter] fallback error.transactionLogs:', resolved);
+                } catch (tErr) {
+                  console.error('[transactionSenderAndConfirmationWaiter] fallback error.transactionLogs (rejected):', (tErr as any)?.message ?? String(tErr));
+                }
+              }
+            }
+          } catch (_) {}
+          // small delay before next candidate to avoid tight loop against overloaded RPCs
+          try { await wait(200); } catch (_) {}
+        }
       }
-    }
 
-    if (!txid) {
-      // no fallback succeeded, rethrow original
-      throw firstErr;
-    }
+      if (!txid) {
+        // no fallback succeeded, rethrow original
+        throw firstErr;
+      }
   }
 
   const controller = new AbortController();
@@ -133,8 +209,12 @@ export async function transactionSenderAndConfirmationWaiter({
 
   try {
     abortableResender();
-    const lastValidBlockHeight =
-      blockhashWithExpiryBlockHeight.lastValidBlockHeight - 150;
+    // Use the provided blockhashWithExpiryBlockHeight as-is. Subtracting a large
+    // number here artificially shortens the available confirmation window and
+    // can cause TransactionExpiredBlockheightExceededError even when the
+    // transaction was recently broadcast. Use the value directly so callers can
+    // rely on the blockhash expiry returned by the source (e.g. Jupiter).
+    const lastValidBlockHeight = blockhashWithExpiryBlockHeight.lastValidBlockHeight;
 
     // this would throw TransactionExpiredBlockheightExceededError
     await Promise.race([
@@ -163,6 +243,7 @@ export async function transactionSenderAndConfirmationWaiter({
   } catch (e) {
     if (e instanceof TransactionExpiredBlockheightExceededError) {
       // we consume this error and getTransaction would return null
+      console.warn('[transactionSenderAndConfirmationWaiter] TransactionExpiredBlockheightExceededError: blockhash expired before confirmation; returning null');
       return null;
     } else {
       // invalid state from web3.js

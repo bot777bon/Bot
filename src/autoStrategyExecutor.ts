@@ -11,7 +11,9 @@ import { getSolBalance } from './getSolBalance';
 export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode: 'buy' | 'sell' = 'buy', options: { simulateOnly?: boolean, listenerBypass?: boolean } = {}) {
   // Return a list of results per-token so callers can inspect simulation outcomes
   const results: any[] = [];
-  if (!user.strategy || !user.wallet || !user.secret || user.strategy.enabled === false) return results;
+  // Allow simulate-only runs even if the user hasn't set a wallet/secret.
+  // For live buys we still require wallet/secret; callers can pass options.simulateOnly to run simulations without credentials.
+  if (!user || !user.strategy || user.strategy.enabled === false) return results;
 
   // If caller indicates listenerBypass, skip strategy filtering (sniper button flow should not filter)
   const filteredTokens = options.listenerBypass ? (Array.isArray(tokens) ? tokens : []) : filterTokensByStrategy(tokens, user.strategy);

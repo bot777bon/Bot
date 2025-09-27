@@ -21,7 +21,7 @@ const UserService: any = new (class {
 })();
 import { copytoclipboard, fromWeiToValue } from "../utils";
 import { GrowTradeVersion, MAX_WALLET, private_connection } from "../config";
-const MsgLogService = new (class { async create(_obj:any){return true} async findOne(_q:any){return null} })();
+const MsgLogService = new (class { async create(_obj:any){return true} async findOne(_q:any){ return null as any } })();
 // simple in-memory redis shim
 const redisClient = new (class {
   private map = new Map<string, any>();
@@ -35,23 +35,46 @@ import {
   SET_JITO_FEE,
   TradeBotID,
 } from "../bot.opts";
+// Provide runtime enum-like values since types.d.ts declares GasFeeEnum/JitoFeeEnum as types only
+export const GasFeeEnumValues = Object.freeze({ HIGH: 2, MEDIUM: 1, LOW: 0, CUSTOM: 3 });
+export const JitoFeeEnumValues = Object.freeze({ HIGH: 2, MEDIUM: 1, LOW: 0, CUSTOM: 3 });
+// aliases so older code referencing GasFeeEnum.HIGH keeps working
+const GasFeeEnum: any = GasFeeEnumValues;
+const JitoFeeEnum: any = JitoFeeEnumValues;
+
 const UserTradeSettingService = new (class {
   async getSlippage(_username: string) { return { slippage: 1 } }
-  async getGas(_username: string) { return { gas: 0.000005 } }
-  getGasValue(setting: any) { return setting?.gas ?? 0.000005 }
-  async getJitoFee(_username: string) { return { enabled: false } }
+  async getGas(_username: string) { return { gas: GasFeeEnumValues.MEDIUM, value: 0.000005 } }
+  getGasValue(setting: any) { return (setting && setting.value) ?? 0.000005 }
+  // Implement expected helpers used in this screen
+  getNextGasFeeOption(current?: number) {
+    if (current === GasFeeEnumValues.HIGH) return GasFeeEnumValues.MEDIUM;
+    if (current === GasFeeEnumValues.MEDIUM) return GasFeeEnumValues.LOW;
+    if (current === GasFeeEnumValues.LOW) return GasFeeEnumValues.CUSTOM;
+    return GasFeeEnumValues.HIGH;
+  }
+  async setGas(_username: string, _setting: any) { return true }
+
+  async getJitoFee(_username: string) { return { enabled: false, jitoOption: JitoFeeEnumValues.MEDIUM, value: 0 } }
   getJitoFeeValue(_s:any){ return 0 }
+  getNextJitoFeeOption(current?: number) {
+    if (current === JitoFeeEnumValues.HIGH) return JitoFeeEnumValues.MEDIUM;
+    if (current === JitoFeeEnumValues.MEDIUM) return JitoFeeEnumValues.LOW;
+    if (current === JitoFeeEnumValues.LOW) return JitoFeeEnumValues.CUSTOM;
+    return JitoFeeEnumValues.HIGH;
+  }
+  async setJitoFee(_username: string, _setting: any) { return true }
 })();
 import { welcomeKeyboardList } from "./welcome.screen";
 import { GenerateReferralCode } from "./referral.link.handler";
-const TokenService = new (class { async getSOLBalance(_w:string){return 0} async getTokenAccounts(_w:string){return []} async getMintInfo(m:any){ return { overview: { name: 'TOK', symbol: 'TOK', price:0, decimals:9}, secureinfo: { isToken2022:false } } } async getSPLBalance(_a:any,_b:any,_c:any,_d?:any){return 0} })();
-class PNLService { constructor(_a?:any,_b?:any,_c?:any){} async initialize(){} async getPNLInfo(){return null} async getBoughtAmount(){return 0} }
+const TokenService = new (class { async getSOLBalance(_w:string){return 0} async getTokenAccounts(_w:string){return []} async getMintInfo(m:any){ return { overview: { name: 'TOK', symbol: 'TOK', price:0, decimals:9}, secureinfo: { isToken2022:false } } } async getSPLBalance(_a:any,_b:any,_c:any,_d?:any){return 0} async fetchSimpleMetaData(_pubkey:any){ return { name: 'TOK', symbol: 'TOK' } } async getSOLPrice(){ return 20 } async getMintMetadata(_conn:any,_pubkey:any){ return { parsed: { info: { decimals: 9, supply: '0', freezeAuthority: null, mintAuthority: null } }, program: 'spl-token' } } })();
+class PNLService { constructor(_a?:any,_b?:any,_c?:any){} async initialize(){} async getPNLInfo(){return null} async getBoughtAmount(){return 0} async getPNLCard(_d:any){ return { pnlUrl: '' } } }
 const RaydiumTokenService = new (class { async findLastOne(_q:any){return null} })();
-class JupiterService { async getQuote(_a:any,_b:any,_c:any,_d:any,_e:any){return null} }
+class JupiterService { async getQuote(_a:any,_b:any,_c:any,_d:any,_e:any){return null} async checkTradableOnJupiter(_mint:string){ return false } }
 import { NATIVE_MINT } from "@solana/spl-token";
 import { calcAmountOut } from "../raydium/raydium.service";
 import { getCoinData } from "../pump/api";
-
+// ...existing code...
 export const settingScreenHandler = async (
   bot: TelegramBot,
   msg: TelegramBot.Message,
@@ -252,8 +275,9 @@ export const walletViewHandler = async (
       return;
     }
 
-    const users = await UserService.findAndSort({ username });
-    const activeuser = users.filter((user) => user.retired === false)[0];
+  /** @type {any[]} */
+  const users = await UserService.findAndSort({ username });
+  const activeuser = users.filter((u: any) => u.retired === false)[0];
     const { wallet_address } = activeuser;
 
     const caption =
@@ -270,8 +294,8 @@ export const walletViewHandler = async (
       disable_web_page_preview: true,
       reply_markup: {
         inline_keyboard: [
-          ...users.map((user) => {
-            const { nonce, wallet_address, retired } = user;
+          ...users.map((user: any) => {
+            const { nonce, wallet_address, retired } = /** @type any */ (user);
             return [
               {
                 text: `${retired ? "🔴" : "🟢"} ${wallet_address}`,
@@ -1245,7 +1269,8 @@ export const pnlCardHandler = async (
       percent: number;
     }
     await pnlService.initialize();
-    const pnldata = (await pnlService.getPNLInfo()) as PNLData;
+      const pnldataRaw = await pnlService.getPNLInfo();
+      const pnldata = pnldataRaw ? (pnldataRaw as unknown as PNLData) : null;
     const boughtInSOL = await pnlService.getBoughtAmount();
     const { profitInSOL, percent } = pnldata
       ? pnldata

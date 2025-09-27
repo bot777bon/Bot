@@ -1,0 +1,98 @@
+{
+  "common": {
+    "welcome": "👋 Welcome to the Trading Bot! Please choose an option:",
+    "wallet_options": "💼 Wallet options:",
+    "show_wallet": "👁️ Show wallet",
+    "no_wallet": "❌ No wallet registered. You can create one or restore it.",
+    "wallet_created": "✅ Wallet created successfully!\nAddress: <code>{{address}}</code>",
+    "wallet_changed": "✅ Wallet changed successfully!\nAddress: <code>{{address}}</code>",
+    "show_full_key_private_only": "🔑 Your private key (masked):\n<code>{{masked}}</code>\n\nTo view the full key, open a private chat with the bot and press the button below.",
+    "reveal_prompt": "🔐 Reveal full key (private only)",
+    "set_lang_success": "✅ Language set to {{lang}}",
+    "change_wallet": "✏️ Change wallet",
+    "create_wallet": "➕ Create wallet",
+    "restore_wallet": "🔁 Restore wallet",
+    "restore_prompt_private": "🔑 Please send your wallet private key now in a private message (it will be received here).",
+    "reveal_private_only": "❌ For your safety, full private keys can only be revealed in a private chat. Open a private chat with the bot and try again.",
+    "full_private_key": "🔑 Your private key:\n<code>{{secret}}</code>",
+    "wallet_restored_success": "✅ Wallet restored successfully!\nAddress: <code>{{address}}</code>\nPrivate key (keep it safe): <code>{{secret}}</code>",
+    "restore_failed_invalid": "❌ Failed to restore wallet. Invalid key. Try again or create a new wallet.",
+    "error_processing_results": "❌ Error processing results. Check server logs.",
+    "error_fetching_mints": "❌ Error fetching mints. Check server logs.",
+    "share": "Share"
+  },
+  "strategy": {
+    "setup_intro": "🚦 Strategy Setup:\nPlease enter the required value for each field. Send \"skip\" to skip any optional field.",
+    "field_prompt": "📝 {{label}}{{optional}}"
+  },
+  "main": {
+    "wallet": "💼 Wallet",
+    "strategy": "⚙️ Strategy",
+    "show_tokens": "📊 Show Tokens",
+    "invite_friends": "🤝 Invite Friends",
+    "sniper_cex": "Sniper CEX",
+    "sniper": "sniper DEX",
+    "language": "🌐 Language",
+    "settings": "🔁 Settings",
+    "keyboard_updated": "✅ Keyboard updated",
+    "show_tokens_help": "To view tokens matching your strategy, use the /show_token command.",
+    "invite_friends_msg": "🤝 Share this link to invite your friends:\n{{link}}",
+    "no_tokens_match": "No tokens currently match your strategy.",
+    "notifications_sent": "✅ Notification sent for tokens matching your strategy."
+  },
+  "main_extra": {
+    "choose_language": "Choose language / اختر اللغة:"
+  },
+  "commands": {
+    "set_mints_usage": "Usage: /set_mints <N> — set the number of mints you want returned when pressing Sniper (example: /set_mints 3)",
+    "invalid_number": "Please enter a valid number between 1 and 20.",
+    "mints_set": "✅ Number of mints set to {{n}}. Press Sniper to see the latest {{n}} fresh mints.",
+    "provide_private_key": "❗ Please provide the private key after the command. Example: /restore_wallet <secret>"
+  },
+  "common_extra": {
+    "no_strategy_or_wallet": "❌ You must set a strategy first using /strategy"
+  },
+  "buy": {
+    "button": "Buy",
+    "invalid_buy_amount": "❌ Your strategy does not have a valid buy amount configured. Please set `buyAmount` in your strategy or use the Settings to configure the buy amount before using the Buy button.",
+    "buying_token": "🛒 Buying token: <code>{{token}}</code> with amount: <b>{{amount}}</b> SOL ...",
+    "purchase_cancelled": "❌ Purchase cancelled: {{msg}}",
+    "success": "Token bought successfully!\nAuto-sell order placed for profit target {{percent}}%.\nCheck your orders with /pending_sells",
+    "failed_tx": "Buy failed: Transaction was not completed.",
+    "error": "❌ Error during buy: {{err}}"
+  },
+  "sell": {
+    "button": "Sell",
+    "selling_token": "🔻 Selling token: <code>{{token}}</code> with <b>{{percent}}%</b> of your balance ({{balance}}) ...",
+    "success": "Token sold successfully!",
+    "failed_tx": "Sell failed: Transaction was not completed.",
+    "error": "❌ Error during sell: {{err}}"
+  },
+  "wallet_msgs": {
+    "masked_message": "🔑 Your wallet private key (masked):\n{{masked}}",
+    "no_wallet_found": "❌ No wallet found for this user.",
+    "wallet_created_success": "✅ Wallet created successfully!\nAddress: <code>{{address}}</code>\nPrivate key (keep it safe): <code>{{secret}}</code>"
+  },
+  "cex": {
+    "received_partial_key": "✅ Received API key. Now send the SECRET in one message, or send APIKEY:SECRET directly.",
+    "api_keys_saved": "✅ Your API keys have been saved (encrypted).",
+    "api_keys_save_failed": "❌ Failed to save API keys.",
+    "no_pending_confirm": "ℹ️ No pending API keys to confirm.",
+    "pending_discarded": "❌ Pending API keys discarded.",
+    "no_pending_cancel": "ℹ️ No pending API keys to cancel.",
+    "ephemeral_test_failed": "❌ Ephemeral test failed: {{err}}",
+    "invalid_test_format": "❌ Invalid TEST format. Use TEST:APIKEY:SECRET or TEST:PLATFORM:APIKEY:SECRET",
+    "invalid_format": "❌ Invalid format. Use APIKEY:SECRET or PLATFORM:APIKEY:SECRET",
+    "not_expecting_keys": "ℹ️ I was not expecting CEX keys right now. Press the CEX Sniper button first to start the key setup.",
+    "test_not_implemented": "ℹ️ TEST for platform {{platform}} is not implemented. Keys look syntactically valid; no validation performed.",
+    "key_validation_success": "✅ Key validation succeeded. USDT balance: free={{free}}, locked={{locked}}\nAccount permissions: {{permissions}}",
+    "already_have_keys": "⚠️ You already have API keys saved. Reply with <b>CONFIRM</b> to overwrite or <b>CANCEL</b> to discard the new keys. (Platform: {{platform}})",
+    "key_validation_failed": "❌ Key validation failed: {{err}}\nPlease check your keys and try again."
+  },
+  "sniper": {
+    "fetching": "🔎 Fetching latest {{n}} fresh mints...",
+    "no_mints": "ℹ️ No fresh mints were found in both attempts. The network may be quiet or RPC limits applied. Try again later or increase RUNNER_TIMEOUT_MS.",
+    "retrying": "ℹ️ No immediate mints found — retrying with a longer timeout.",
+    "collect_func_missing": "⚠️ Internal error: collectFreshMints function is not available on the server."
+  }
+}

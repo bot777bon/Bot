@@ -60,7 +60,7 @@ const MsgLogService = new (class {
   async findOne(query: any) {
     // return a basic msglog sample for called message ids
     if (query && query.msg_id) {
-      return { mint: "So11111111111111111111111111111111111111112", wallet_address: "", spl_amount: 0, sol_amount: 1, parent_msgid: query.msg_id - 1 };
+      return ({ mint: "So11111111111111111111111111111111111111112", wallet_address: "", spl_amount: 0, sol_amount: 1, parent_msgid: query.msg_id - 1 } as any);
     }
     return null;
   }
@@ -68,7 +68,7 @@ const MsgLogService = new (class {
     return true;
   }
 })();
-
+ 
 class JupiterService {
   async transferSOL(_amount: number, _dec: number, _to: string, _pk: string, _priorityFee: number, _maxFee: number) {
     // simulate a tx signature
@@ -515,10 +515,14 @@ export const cancelWithdrawHandler = async (
 
   if (!msglog) return;
 
-  const { parent_msgid, extra_id } = msglog;
-  bot.deleteMessage(chat_id, message_id);
-  if (extra_id) {
-    bot.deleteMessage(chat_id, extra_id);
-  }
-  bot.deleteMessage(chat_id, parent_msgid);
+    // msglog may contain optional extra_id
+    const parent_msgid = (msglog && msglog.parent_msgid) as number | undefined;
+  const extra_id = (msglog && ((/** @type any */ (msglog)).extra_id as number | undefined)) || (msglog && ((/** @type any */ (msglog)).extraId as number | undefined));
+    bot.deleteMessage(chat_id, message_id);
+    if (extra_id) {
+      bot.deleteMessage(chat_id, extra_id);
+    }
+    if (parent_msgid) {
+      bot.deleteMessage(chat_id, parent_msgid);
+    }
 };

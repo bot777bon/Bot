@@ -35,7 +35,11 @@ export function limitHistory(user: any, max = 50) {
 }
 
 export function hasWallet(user: any): boolean {
-  return !!(user && user.wallet && user.secret);
+  // Support legacy single wallet (user.wallet + user.secret) or new multiple wallets stored in user.wallets array
+  if (!user) return false;
+  if (user.wallet && user.secret) return true;
+  if (Array.isArray(user.wallets) && user.wallets.length > 0) return true;
+  return false;
 }
 
 export function walletKeyboard() {

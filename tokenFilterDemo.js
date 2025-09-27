@@ -12,7 +12,8 @@ function askCriteria() {
       input: process.stdin,
       output: process.stdout
     });
-    const criteria = {};
+  /** @type {{minAmount?: number, description?: string}} */
+  const criteria = {};
     rl.question('Enter minimum amount (number, default 10): ', (minAmount) => {
       criteria.minAmount = isNaN(Number(minAmount)) || minAmount === '' ? 10 : Number(minAmount);
       rl.question('Enter description substring to filter (leave empty for no filter): ', (desc) => {
@@ -24,24 +25,37 @@ function askCriteria() {
   });
 }
 
+/**
+ * @param {any[]} tokens
+ * @param {{minAmount?: number, description?: string}} criteria
+ */
 function filterTokens(tokens, criteria) {
   return tokens.filter(t => {
-    if (criteria.minAmount && t.amount < criteria.minAmount) return false;
-    if (criteria.description && !t.description.toLowerCase().includes(criteria.description.toLowerCase())) return false;
+    const amount = t && (t.amount ?? t.tokenAmount ?? t.balance ?? 0);
+    const description = (t && (t.description || t.name || t.title || '')) || '';
+    if (criteria.minAmount && amount < criteria.minAmount) return false;
+    if (criteria.description && !description.toLowerCase().includes(criteria.description.toLowerCase())) return false;
     return true;
   });
 }
 
+/**
+ * @param {any[]} tokens
+ */
 function printTokens(tokens) {
-  if (!tokens.length) {
+  if (!tokens || !tokens.length) {
     console.log('No tokens match the criteria.');
     return;
   }
   tokens.forEach((t, i) => {
-    const bar = '█'.repeat(Math.min(Math.round(t.amount / 5), 20));
-    console.log(`\n${i+1}. ${t.description} (${t.tokenAddress})`);
-    console.log(`Amount: ${t.amount} ${bar}`);
-    console.log(`URL: ${t.url}`);
+    const amount = t && (t.amount ?? t.tokenAmount ?? t.balance ?? 0);
+    const bar = '█'.repeat(Math.min(Math.max(0, Math.round(amount / 5)), 20));
+    const description = (t && (t.description || t.name || t.title)) || 'Unknown';
+    const tokenAddress = (t && (t.tokenAddress || t.address || t.id)) || 'N/A';
+    const url = (t && (t.url || t.link)) || 'N/A';
+    console.log(`\n${i+1}. ${description} (${tokenAddress})`);
+    console.log(`Amount: ${amount} ${bar}`);
+    console.log(`URL: ${url}`);
   });
 }
 

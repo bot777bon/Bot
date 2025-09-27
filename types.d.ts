@@ -13,8 +13,8 @@ declare global {
 	// Minimal placeholders to satisfy TypeScript in this workspace
 	type QuoteRes = any;
 	type TokenSecurityInfoDataType = any;
-		type GasFeeEnum = number;
-		type JitoFeeEnum = number;
+	type GasFeeEnum = number;
+	type JitoFeeEnum = number;
 }
 
 export {};

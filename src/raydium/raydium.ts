@@ -80,7 +80,7 @@ const TokenService = new (class {
   }
 })();
 
-export const RaydiumTokenService = new (class {
+export const RaydiumTokenService: any = new (class {
   private store = new InMemoryStore<any>();
   async create(data: any) {
     return this.store.create(data);

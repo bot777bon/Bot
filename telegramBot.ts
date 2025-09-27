@@ -6,6 +6,7 @@ import Binance from 'binance-api-node';
 import axios from 'axios';
 import crypto from 'crypto';
 import { loadUsers, saveUsers, walletKeyboard, getErrorMessage, limitHistory, hasWallet } from './src/bot/helpers';
+import { t, setUserLang, getAvailableLangs, tForLang } from './src/i18n';
 import { helpMessages } from './src/helpMessages';
 import { unifiedBuy, unifiedSell } from './src/tradeSources';
 import { filterTokensByStrategy, registerBuyWithTarget, monitorAndAutoSellTrades } from './src/bot/strategy';
@@ -31,6 +32,9 @@ console.log('--- Telegraf instance created ---');
 
 function escapeHtml(str: string){
   return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function escapeRegex(s: string) {
+  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 // Helper to normalize various shapes returned by unifiedBuy/unifiedSell
 function extractTx(res: any): string | null {
@@ -74,6 +78,103 @@ function validateNotificationPayload(payload: any) {
 }
 let users: Record<string, any> = loadUsers();
 console.log('--- Users loaded ---');
+
+// Sent-token hash helpers used by wsListener.ts — simple file-backed store
+import cryptoHash from 'crypto';
+const SENT_HASH_FILE = './sent_tokens/sent_hashes.json';
+function ensureSentFile() {
+  try {
+    const p = require('path').resolve(SENT_HASH_FILE);
+    const fs = require('fs');
+    if (!fs.existsSync(require('path').dirname(p))) require('fs').mkdirSync(require('path').dirname(p), { recursive: true });
+    if (!fs.existsSync(p)) fs.writeFileSync(p, JSON.stringify({}));
+    return p;
+  } catch (e) { return SENT_HASH_FILE; }
+}
+function hashTokenAddress(addr: string) {
+  try {
+    return cryptoHash.createHash('sha256').update(String(addr || '')).digest('hex');
+  } catch (_) { return String(addr || ''); }
+}
+function readSentHashes(userId: string) {
+  try {
+    const fs = require('fs');
+    const p = ensureSentFile();
+    const data = JSON.parse(fs.readFileSync(p, 'utf8') || '{}');
+    const s = data[String(userId)] || [];
+    return new Set(s);
+  } catch (e) { return new Set(); }
+}
+function appendSentHash(userId: string, hash: string) {
+  try {
+    const fs = require('fs');
+    const p = ensureSentFile();
+    const data = JSON.parse(fs.readFileSync(p, 'utf8') || '{}');
+    data[String(userId)] = data[String(userId)] || [];
+    if (!data[String(userId)].includes(hash)) data[String(userId)].push(hash);
+    fs.writeFileSync(p, JSON.stringify(data, null, 2));
+    return true;
+  } catch (e) { return false; }
+}
+
+export { hashTokenAddress, readSentHashes, appendSentHash };
+
+// Ensure wallets are normalized at startup: dedupe, sort by createdAt, and set the last-added wallet as active
+function normalizeAllUserWallets() {
+  users = loadUsers();
+  let dirty = false;
+  for (const userId of Object.keys(users || {})) {
+    const u: any = users[userId] || {};
+    u.wallets = Array.isArray(u.wallets) ? u.wallets.slice() : [];
+
+    // If legacy top-level wallet exists and not present in wallets[], add it
+    if (u.wallet && u.secret) {
+      const found = u.wallets.find((w: any) => w && w.wallet === u.wallet);
+      if (!found) {
+        u.wallets.push({ wallet: u.wallet, secret: u.secret, createdAt: Date.now() });
+        dirty = true;
+      } else if (!found.secret) {
+        found.secret = u.secret;
+        dirty = true;
+      }
+    }
+
+    // Deduplicate by wallet address, keep the entry with the largest createdAt
+    const map = new Map<string, any>();
+    for (const item of u.wallets) {
+      if (!item || !item.wallet) continue;
+      const prev = map.get(item.wallet);
+      if (!prev || (item.createdAt || 0) > (prev.createdAt || 0)) {
+        map.set(item.wallet, { ...item });
+      }
+    }
+    const arr = Array.from(map.values()).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+    u.wallets = arr;
+
+    // Select the last-added (highest createdAt) as active
+    if (u.wallets.length) {
+      const active = u.wallets[u.wallets.length - 1];
+      // mark active flag for clarity
+      u.wallets = u.wallets.map((w: any) => ({ ...w, active: w.wallet === active.wallet }));
+      if (u.wallet !== active.wallet || u.secret !== active.secret) {
+        u.wallet = active.wallet;
+        u.secret = active.secret;
+        dirty = true;
+      }
+    } else {
+      if (u.wallet || u.secret) {
+        delete u.wallet;
+        delete u.secret;
+        dirty = true;
+      }
+    }
+    users[userId] = u;
+  }
+  if (dirty) saveUsers(users);
+}
+
+// Run normalization once at startup so `user.wallet`/`user.secret` reflect the last-added wallet
+try { normalizeAllUserWallets(); } catch (e) { console.error('Failed to normalize user wallets on startup', e); }
 
 // --- Minimal crypto key storage (user-backed) ---
 const FERNET_KEY = process.env.FERNET_KEY || '';
@@ -168,7 +269,7 @@ if (!(globalThis as any).__pendingPartial) (globalThis as any).__pendingPartial 
 // Dedicated text handler for API key storage (CONFIRM/CANCEL and APIKEY:SECRET)
 bot.on('text', async (ctx, next) => {
   try {
-    const text = (ctx.message as any).text?.trim();
+    let text = (ctx.message as any).text?.trim();
     const chatId = String(ctx.from?.id);
     if (!text) return typeof next === 'function' ? next() : undefined;
     const pending = (globalThis as any).__pendingKeys as Map<string, { k: string, s: string }>;
@@ -187,51 +288,51 @@ bot.on('text', async (ctx, next) => {
         if (text.includes('\n')) {
           const parts = text.split(/\r?\n/).map((s: string) => s.trim()).filter(Boolean);
           if (parts.length >= 2) {
-            // treat as apiKey:secret
-            ctx.message.text = `${parts[0]}:${parts[1]}`;
+            // treat as apiKey:secret (use local variable instead of mutating ctx.message.text)
+            text = `${parts[0]}:${parts[1]}`;
           }
         } else if (text.includes(':') || text.includes(' ')) {
           // leave as-is (will be parsed below)
         } else {
           // no delimiter and not a control command -> could be a partial API key or secret
           const existingPartial = partial.get(chatId);
-          if (existingPartial && existingPartial.k && !existingPartial.s) {
+            if (existingPartial && existingPartial.k && !existingPartial.s) {
             // treat current text as secret and continue
             const apiKey = existingPartial.k;
             const apiSecret = text.trim();
             partial.delete(chatId);
-            // perform validation & save flow (reuse code path below by constructing a virtual message)
-            ctx.message.text = `${apiKey}:${apiSecret}`;
+            // perform validation & save flow using local variable
+            text = `${apiKey}:${apiSecret}`;
           } else {
             // store as partial API key and ask for secret
             partial.set(chatId, { k: text.trim() });
-            try { await ctx.reply('� استلمت مفتاح API. الآن أرسل السر (SECRET) في رسالة واحدة فقط، أو أرسل APIKEY:SECRET مباشرة.'); } catch (_) {}
+            try { await ctx.reply(t('cex.received_partial_key', chatId)); } catch (_) {}
             return;
           }
         }
       }
     }
-    if (text.toUpperCase() === 'CONFIRM') {
+  if (String(text).toUpperCase() === 'CONFIRM') {
       if (pending && pending.has(chatId)) {
         const p = pending.get(chatId)!;
         const ok = await cryptoAddUser(chatId, p.k, p.s);
         pending.delete(chatId);
-        return ctx.reply(ok ? '✅ Your API keys have been saved (encrypted).' : '❌ Failed to save API keys.');
+  return ctx.reply(ok ? t('cex.api_keys_saved', chatId) : t('cex.api_keys_save_failed', chatId));
       }
-      return ctx.reply('ℹ️ No pending API keys to confirm.');
+  return ctx.reply(t('cex.no_pending_confirm', chatId));
     }
-    if (text.toUpperCase() === 'CANCEL') {
+  if (String(text).toUpperCase() === 'CANCEL') {
       if (pending && pending.has(chatId)) {
         pending.delete(chatId);
-        return ctx.reply('❌ Pending API keys discarded.');
+  return ctx.reply(t('cex.pending_discarded', chatId));
       }
-      return ctx.reply('ℹ️ No pending API keys to cancel.');
+  return ctx.reply(t('cex.no_pending_cancel', chatId));
     }
 
     if (text.includes(':')) {
         // Support TEST:APIKEY:SECRET for ephemeral tests without saving
-        if (text.toUpperCase().startsWith('TEST:')) {
-          const payload = text.split(':').slice(1);
+        if (String(text).toUpperCase().startsWith('TEST:')) {
+          const payload = String(text).split(':').slice(1);
           // Accept TEST:API:SECRET or TEST:PLATFORM:API:SECRET
           if (payload.length === 2) {
             const apiKey = payload[0].trim();
@@ -248,7 +349,7 @@ bot.on('text', async (ctx, next) => {
               await ctx.reply(msg);
             } catch (e: any) {
               console.error('TEST ephemeral check failed', e);
-              await ctx.reply('❌ Ephemeral test failed: ' + (e && e.message ? e.message : String(e)));
+              await ctx.reply(t('cex.ephemeral_test_failed', chatId, { err: (e && e.message ? e.message : String(e)) }));
             }
             return;
           } else if (payload.length >= 3) {
@@ -256,7 +357,7 @@ bot.on('text', async (ctx, next) => {
             const platform = payload[0].trim().toUpperCase();
             const apiKey = payload[1].trim();
             const apiSecret = payload.slice(2).join(':').trim();
-            if (!apiKey || !apiSecret) return ctx.reply('❌ Invalid TEST format. Use TEST:PLATFORM:APIKEY:SECRET');
+            if (!apiKey || !apiSecret) return ctx.reply(t('cex.invalid_test_format', chatId));
             if (platform === 'BINANCE') {
               try {
                 const client = Binance({ apiKey, apiSecret });
@@ -270,20 +371,20 @@ bot.on('text', async (ctx, next) => {
                 await ctx.reply(msg);
               } catch (e: any) {
                 console.error('TEST ephemeral check failed (binance)', e);
-                await ctx.reply('❌ Ephemeral test failed: ' + (e && e.message ? e.message : String(e)));
+                await ctx.reply(t('cex.ephemeral_test_failed', chatId, { err: (e && e.message ? e.message : String(e)) }));
               }
               return;
             }
             // For other platforms we don't have validation implemented — inform user
-            await ctx.reply(`ℹ️ TEST for platform ${platform} is not implemented. Keys look syntactically valid; no validation performed.`);
+            await ctx.reply(t('cex.test_not_implemented', chatId, { platform }));
             return;
           } else {
-            return ctx.reply('❌ Invalid TEST format. Use TEST:APIKEY:SECRET or TEST:PLATFORM:APIKEY:SECRET');
+            return ctx.reply(t('cex.invalid_test_format', chatId));
           }
         }
 
         // Support PLATFORM:API:SECRET (3 parts) or API:SECRET (2 parts)
-        const allParts = text.split(':').map((s: string) => s.trim()).filter(Boolean);
+  const allParts = String(text).split(':').map((s: string) => s.trim()).filter(Boolean);
         let platform = 'BINANCE';
         let apiKey = '';
         let apiSecret = '';
@@ -296,13 +397,13 @@ bot.on('text', async (ctx, next) => {
           apiKey = allParts[1];
           apiSecret = allParts.slice(2).join(':');
         } else {
-          return ctx.reply('❌ Invalid format. Use APIKEY:SECRET or PLATFORM:APIKEY:SECRET');
+          return ctx.reply(t('cex.invalid_format', chatId));
         }
-      if (!apiKey || !apiSecret) return ctx.reply('❌ Invalid format. Use APIKEY:SECRET');
+  if (!apiKey || !apiSecret) return ctx.reply(t('cex.invalid_format', chatId));
       // If we weren't explicitly expecting keys from this user, ignore
       const expecting = (globalThis as any).__expectingCexKeys as Set<string>;
-      if (!expecting || !expecting.has(chatId)) {
-        return ctx.reply('ℹ️ I was not expecting CEX keys right now. Press the CEX Sniper button first to start the key setup.');
+    if (!expecting || !expecting.has(chatId)) {
+  return ctx.reply(t('cex.not_expecting_keys', chatId));
       }
       // attempt to validate keys by calling the platform API when supported (Binance, MEXC, Bybit, Gate)
       try {
@@ -358,10 +459,9 @@ bot.on('text', async (ctx, next) => {
   // Format balances similar to the example (use exponential if small)
   const fmtFree = (Math.abs(free) < 1e-6) ? free.toExponential() : String(free);
   const fmtLocked = (Math.abs(locked) < 1e-6) ? locked.toExponential() : String(locked);
-  let msg = `✅ Key validation succeeded. USDT balance: free=${fmtFree}, locked=${fmtLocked}\n`;
   // default to SPOT for MEXC if permissions not provided
   const permissionsText = (info && info.permissions) ? (Array.isArray(info.permissions) ? info.permissions.join(', ') : String(info.permissions)) : (platform === 'MEXC' ? 'SPOT' : (platform === 'BINANCE' ? 'unknown' : 'validation skipped for platform ' + platform));
-  msg += `Account permissions: ${permissionsText}`;
+  const msg = t('cex.key_validation_success', chatId, { free: fmtFree, locked: fmtLocked, permissions: permissionsText });
         // Save or mark pending depending on existing keys
         const existing = await cryptoGetUserKeys(chatId);
         if (!existing) {
@@ -375,20 +475,20 @@ bot.on('text', async (ctx, next) => {
           expecting.delete(chatId);
           // For MEXC produce the exact requested message
           if (ok && platform === 'MEXC') {
-            const reply = `${msg}\n\n✅ Your API keys are saved (encrypted). Platform: MEXC`;
+            const reply = msg + '\n\n' + t('cex.api_keys_saved', chatId) + ' Platform: MEXC';
             return ctx.reply(reply);
           }
-          return ctx.reply(ok ? (msg + '\n\n✅ Your API keys are saved (encrypted). Platform: ' + platform) : '❌ Failed to save API keys.');
+          return ctx.reply(ok ? (msg + '\n\n' + t('cex.api_keys_saved', chatId) + ' Platform: ' + platform) : t('cex.api_keys_save_failed', chatId));
         }
   // if exist, set pending and ask for confirmation. store platform in pending too
   pending.set(chatId, { k: apiKey, s: apiSecret });
   // persist platform in pending map (store separate map entry)
   try { (pending as any).__platforms = (pending as any).__platforms || new Map(); (pending as any).__platforms.set(chatId, platform); } catch (_) {}
   expecting.delete(chatId);
-  return ctx.reply(msg + `\n\n⚠️ You already have API keys saved. Reply with <b>CONFIRM</b> to overwrite or <b>CANCEL</b> to discard the new keys. (Platform: ${platform})`, { parse_mode: 'HTML' });
+  return ctx.reply(msg + '\n\n' + t('cex.already_have_keys', chatId, { platform }), { parse_mode: 'HTML' });
       } catch (e: any) {
         console.error('API key validation failed', e);
-        return ctx.reply('❌ Key validation failed: ' + (e && e.message ? e.message : String(e)) + '\nPlease check your keys and try again.');
+        return ctx.reply(t('cex.key_validation_failed', chatId, { err: (e && e.message ? e.message : String(e)) }));
       } finally {
         try { expecting.delete(chatId); } catch (_) {}
       }
@@ -476,48 +576,266 @@ let boughtTokens: Record<string, Set<string>> = {};
 const restoreStates: Record<string, boolean> = {};
 
 function getMainReplyKeyboard(userId?: string) {
-  // Determine per-user sniper button label (reads listenerMaxCollect or strategy settings)
-  let sniperLabel = 'Sniper';
-  try {
-    if (userId && users && users[userId]) {
-      const u = users[userId];
-      const v = u && u.listenerMaxCollect || u && u.strategy && (u.strategy.listenerMaxCollect || u.strategy.maxCollect || u.strategy.maxTrades);
-      const n = Number(v);
-      const userCount = (!isNaN(n) && n > 0) ? Math.max(1, Math.min(20, Math.floor(n))) : null;
-  if (userCount) sniperLabel = `Sniper (${userCount})`;
-    }
-  } catch (e) {
-    // fallback to default label
-  }
+  // Use the exact translated labels for the main keyboard (no additions or counts)
   return Markup.keyboard([
-    ['💼 Wallet', '⚙️ Strategy'],
-    ['📊 Show Tokens', '🤝 Invite Friends'],
-    [sniperLabel, 'سنايبر المنصات المركزيه']
+    [t('main.wallet', userId), t('main.strategy', userId)],
+    [t('main.show_tokens', userId), t('main.invite_friends', userId)],
+    [t('main.sniper', userId), t('main.sniper_cex', userId)],
+    [t('main.language', userId)]
   ]).resize();
 }
 
+// Helper: test whether the incoming text matches the translation for key in user's lang
+function matchesLabel(text: string, key: string, userId?: string) {
+  text = String(text || '').trim();
+  // first test user's current language
+  const userLang = (userId && (loadUsers()[String(userId)] || {}).lang) || undefined;
+  const candidates = new Set<string>();
+  try {
+    // user's lang first
+    candidates.add(t(key, userId));
+    // all available langs
+    const langs = getAvailableLangs();
+    for (const l of langs) candidates.add(tForLang(key, l));
+  } catch (e) {}
+  for (const c of Array.from(candidates)) {
+    if (!c) continue;
+    if (String(c).trim() === text) return true;
+  }
+  return false;
+}
+
 bot.start(async (ctx) => {
+  const userId = String(ctx.from?.id);
   await ctx.reply(
-    '👋 Welcome to the Trading Bot!\nPlease choose an option:',
-    getMainReplyKeyboard(String(ctx.from?.id))
+    t('common.welcome', userId),
+    getMainReplyKeyboard(userId)
   );
 });
 
-// Show wallet submenu (inline) allowing user to view, create/change, or restore wallet
-bot.hears('💼 Wallet', async (ctx) => {
+// Show language selector immediately on start if user has no language set
+bot.start(async (ctx) => {
   const userId = String(ctx.from?.id);
-  console.log(`[💼 Wallet menu] User: ${userId}`);
-  const user = users[userId];
-  const has = user && hasWallet(user);
-  const buttons: any[] = [];
-  // Show private key (only if exists)
-  if (has) buttons.push([ { text: '👁️ Show wallet', callback_data: 'show_secret_inline' } ]);
-  // Create or change wallet
-  buttons.push([ { text: has ? '✏️ Change wallet' : '➕ Create wallet', callback_data: 'create_or_change_wallet_inline' } ]);
-  // Restore wallet
-  buttons.push([ { text: '🔁 Restore wallet', callback_data: 'restore_wallet_inline' } ]);
+  const usersAll = loadUsers();
+  const u = usersAll[userId] || {};
+  if (!u.lang) {
+    const langs = getAvailableLangs();
+    const buttons = langs.map(l => Markup.button.callback(l, `setlang_${l}`));
+    const rows: any[] = [];
+    for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+    await ctx.reply('Choose language / اختر اللغة:', { reply_markup: { inline_keyboard: rows } } as any);
+  }
+});
 
-  await ctx.reply('💼 Wallet options:', { reply_markup: { inline_keyboard: buttons } } as any);
+// Command to set language for a user
+bot.command('setlang', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  const langs = getAvailableLangs();
+  const buttons = langs.map(l => Markup.button.callback(l, `setlang_${l}`));
+  const rows: any[] = [];
+  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+  await ctx.reply('Choose language / اختر اللغة:', { reply_markup: { inline_keyboard: rows } } as any);
+});
+
+// Unified handler for setlang callbacks: set language, confirm, and resend updated keyboard
+bot.action(/setlang_(.+)/, async (ctx) => {
+  const data = String((ctx.callbackQuery as any).data || '');
+  const m = data.match(/^setlang_(.+)$/);
+  if (!m) return;
+  const lang = m[1];
+  const userId = String(ctx.from?.id);
+  setUserLang(userId, lang);
+  try { await ctx.answerCbQuery(); } catch (_) {}
+  // reload in-memory users so keyboard builder sees updated data
+  try { users = loadUsers(); } catch (_) {}
+  try { await ctx.reply(t('common.set_lang_success', userId, { lang })); } catch (_) {}
+  try { await ctx.reply(t('main.keyboard_updated', userId), getMainReplyKeyboard(userId)); } catch (_) {}
+});
+
+// Admin helpers and commands to manage user languages
+function isAdminId(id?: string | number) {
+  const raw = (process.env.ADMIN_IDS || process.env.ADMIN_ID || '').toString();
+  if (!raw) return false;
+  const allowed = raw.split(',').map(s => s.trim()).filter(Boolean);
+  return allowed.includes(String(id));
+}
+
+bot.command('listusers_lang', async (ctx) => {
+  const caller = String(ctx.from?.id);
+  if (!isAdminId(caller)) return ctx.reply('❌ Unauthorized');
+  const all = loadUsers();
+  const lines: string[] = [];
+  for (const uid of Object.keys(all)) {
+    const u = all[uid] || {};
+    lines.push(`${uid}: ${u.lang || 'en'}`);
+  }
+  if (lines.length === 0) return ctx.reply('No users found');
+  // chunk replies to avoid Telegram limits
+  for (let i = 0; i < lines.length; i += 30) {
+    await ctx.reply(lines.slice(i, i + 30).join('\n'));
+  }
+});
+
+bot.command('setlang_user', async (ctx) => {
+  const caller = String(ctx.from?.id);
+  if (!isAdminId(caller)) return ctx.reply('❌ Unauthorized');
+  const text = (ctx.message && (ctx.message as any).text) || '';
+  const parts = text.trim().split(/\s+/);
+  if (parts.length < 3) return ctx.reply('Usage: /setlang_user <userId> <lang>');
+  const target = parts[1];
+  const lang = parts[2];
+  const avail = getAvailableLangs();
+  if (!avail.includes(lang)) return ctx.reply(`Unknown lang. Available: ${avail.join(',')}`);
+  setUserLang(target, lang);
+  await ctx.reply(`✅ Set ${target} => ${lang}`);
+});
+
+// Admin UI: list users with inline buttons and allow changing language via inline submenu
+bot.command('admin_users', async (ctx) => {
+  const caller = String(ctx.from?.id);
+  if (!isAdminId(caller)) return ctx.reply('❌ Unauthorized');
+  const all = loadUsers();
+  const rows: any[] = [];
+  // build buttons per user (limited to first 50 to avoid huge keyboards)
+  const uids = Object.keys(all).slice(0, 200);
+  for (let i = 0; i < uids.length; i += 2) {
+    const a = uids[i];
+    const b = uids[i + 1];
+    const row: any[] = [];
+    row.push({ text: `${a} (${all[a].lang || 'en'})`, callback_data: `admin_user_${a}` });
+    if (b) row.push({ text: `${b} (${all[b].lang || 'en'})`, callback_data: `admin_user_${b}` });
+    rows.push(row);
+  }
+  if (rows.length === 0) return ctx.reply('No users found');
+  await ctx.reply('Select a user to manage language:', { reply_markup: { inline_keyboard: rows } } as any);
+});
+
+bot.action(/admin_user_(.+)/, async (ctx) => {
+  const caller = String(ctx.from?.id);
+  if (!isAdminId(caller)) return ctx.reply('❌ Unauthorized');
+  const match = String((ctx.callbackQuery as any).data).match(/^admin_user_(.+)$/);
+  if (!match) return;
+  const target = match[1];
+  const usersAll = loadUsers();
+  const userObj = usersAll[target] || {};
+  const cur = userObj.lang || 'en';
+  const langs = getAvailableLangs();
+  const rows: any[] = [];
+  for (let i = 0; i < langs.length; i += 2) {
+    const a = langs[i];
+    const b = langs[i + 1];
+    const row: any[] = [];
+    row.push({ text: `${a}${a===cur? ' ✅' : ''}`, callback_data: `admin_setlang_${target}_${a}` });
+    if (b) row.push({ text: `${b}${b===cur? ' ✅' : ''}`, callback_data: `admin_setlang_${target}_${b}` });
+    rows.push(row);
+  }
+  // also provide a cancel button
+  rows.push([ { text: 'Cancel', callback_data: 'admin_cancel' } ]);
+  // answer the callback and show new message
+  try { await ctx.answerCbQuery(); } catch (_) {}
+  await ctx.reply(`Manage language for ${target} (current: ${cur})`, { reply_markup: { inline_keyboard: rows } } as any);
+});
+
+bot.action(/admin_setlang_(.+)_(.+)/, async (ctx) => {
+  const caller = String(ctx.from?.id);
+  if (!isAdminId(caller)) return ctx.reply('❌ Unauthorized');
+  const data = String((ctx.callbackQuery as any).data);
+  const m = data.match(/^admin_setlang_(.+)_(.+)$/);
+  if (!m) return;
+  const target = m[1];
+  const lang = m[2];
+  const avail = getAvailableLangs();
+  if (!avail.includes(lang)) return ctx.reply('Unknown language');
+  setUserLang(target, lang);
+  try { await ctx.answerCbQuery('Language updated'); } catch (_) {}
+  // reload in-memory users
+  try { users = loadUsers(); } catch (_) {}
+  await ctx.reply(`✅ Set ${target} => ${lang}`);
+  // if target is a numeric chat id, notify them and resend keyboard so their labels update
+  if (/^\d+$/.test(String(target))) {
+    try {
+      await bot.telegram.sendMessage(Number(target), t('common.set_lang_success', target, { lang }));
+      await bot.telegram.sendMessage(Number(target), t('main.keyboard_updated', target), getMainReplyKeyboard(target));
+    } catch (_) {}
+  }
+});
+
+bot.action('admin_cancel', async (ctx) => {
+  try { await ctx.answerCbQuery(); } catch (_) {}
+  try { await ctx.reply('Cancelled'); } catch (_) {}
+});
+
+// Central text router: map translated reply-keyboard labels to handlers so buttons work immediately after language change
+bot.on('text', async (ctx, next) => {
+  const text = String((ctx.message && (ctx.message as any).text) || '');
+  const userId = String(ctx.from?.id);
+  // wallet
+  if (matchesLabel(text, 'main.wallet', userId)) {
+    console.log(`[💼 Wallet menu] User: ${userId}`);
+    const user = users[userId];
+    const has = user && hasWallet(user);
+    const buttons: any[] = [];
+  if (has) buttons.push([ { text: t('common.show_wallet', userId), callback_data: 'show_secret_inline' } ]);
+    buttons.push([ { text: has ? t('common.change_wallet', userId) : t('common.create_wallet', userId), callback_data: 'create_or_change_wallet_inline' } ]);
+    buttons.push([ { text: t('common.restore_wallet', userId), callback_data: 'restore_wallet_inline' } ]);
+    await ctx.reply(t('main.wallet', userId) + ' ' + t('main.settings', userId));
+    return await ctx.reply(t('common.wallet_options', userId), { reply_markup: { inline_keyboard: buttons } } as any);
+  }
+  // strategy
+  if (matchesLabel(text, 'main.strategy', userId)) {
+    console.log(`[⚙️ Strategy] User: ${String(ctx.from?.id)}`);
+    userStrategyStates[userId] = { step: 0, values: {} };
+    await ctx.reply(t('strategy.setup_intro', userId));
+    const field = STRATEGY_FIELDS[0];
+    return await ctx.reply(t('strategy.field_prompt', userId, { label: field.label, optional: field.optional ? ' (optional)' : '' }));
+  }
+  // show tokens
+  if (matchesLabel(text, 'main.show_tokens', userId)) {
+    console.log(`[📊 Show Tokens] User: ${String(ctx.from?.id)}`);
+    return ctx.reply(t('main.show_tokens_help', userId));
+  }
+  // invite friends
+  if (matchesLabel(text, 'main.invite_friends', userId)) {
+    console.log(`[🤝 Invite Friends] User: ${String(ctx.from?.id)}`);
+    const inviteLink = `https://t.me/${ctx.me}?start=${userId}`;
+    return ctx.reply(t('main.invite_friends_msg', userId, { link: inviteLink }));
+  }
+  // language button
+  if (matchesLabel(text, 'main.language', userId)) {
+    const langs = getAvailableLangs();
+    const buttons = langs.map(l => Markup.button.callback(l, `setlang_${l}`));
+    const rows: any[] = [];
+    for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+    return ctx.reply(t('main_extra.choose_language', userId), { reply_markup: { inline_keyboard: rows } } as any);
+  }
+  // Sniper CEX button — match exact translated label only
+  if (matchesLabel(text, 'main.sniper_cex', userId)) {
+    // delegate to existing handler by calling it inline: emulate the previous behavior
+    // Prefer private chat for sharing secrets
+      try {
+      const chatType = (ctx.chat && (ctx.chat as any).type) || '';
+      if (chatType !== 'private') {
+        await ctx.reply(t('cex.private_chat_required', userId));
+        return;
+      }
+      users = loadUsers();
+      const expecting = (globalThis as any).__expectingCexKeys as Set<string>;
+      expecting.add(userId);
+      const have = users[userId] && users[userId].cex ? 'You already have keys saved. Sending new keys will require CONFIRM to overwrite.' : '';
+      return await ctx.reply(t('cex.prompt_enter_keys', userId, { have: have, after: users[userId] && users[userId].cex ? tForLang('cex.already_have_keys', (users[userId] && users[userId].lang) || 'en') : tForLang('cex.api_keys_saved', (users[userId] && users[userId].lang) || 'en') }));
+    } catch (e) {
+      console.error('[Sniper-CEX] handler error', e);
+      try { return await ctx.reply('❌ Failed to start CEX key prompt.'); } catch (_) { return; }
+    }
+  }
+  // DEX Sniper: match the translated label exactly
+  if (matchesLabel(text, 'main.sniper', userId)) {
+    await handleSniper(ctx, undefined);
+    return;
+  }
+  // otherwise let other handlers run
+  if (typeof next === 'function') return next();
+  return;
 });
 
 // Inline handlers for the wallet submenu
@@ -526,9 +844,28 @@ bot.action('show_secret_inline', async (ctx) => {
   users = loadUsers();
   const user = users[userId];
   if (user && hasWallet(user)) {
-    await ctx.reply('🔑 Your private key:\n<code>' + user.secret + '</code>', { parse_mode: 'HTML' });
+    // show masked secret and provide button to reveal in private chat
+    const secret = String(user.secret || '');
+    const masked = secret ? (secret.length > 12 ? (secret.slice(0,6) + '...' + secret.slice(-6)) : ('***' + secret.slice(-6))) : 'N/A';
+    await ctx.reply(t('common.show_full_key_private_only', userId, { masked }), { parse_mode: 'HTML' } as any);
+    await ctx.reply(t('common.reveal_prompt', userId), { reply_markup: { inline_keyboard: [ [ { text: '🔐 ' + t('common.reveal_prompt', userId), callback_data: 'reveal_full_secret' } ] ] } } as any);
   } else {
-    await ctx.reply('❌ No wallet registered. You can create one or restore it.');
+    await ctx.reply(t('common.no_wallet', userId));
+  }
+});
+
+bot.action('reveal_full_secret', async (ctx) => {
+  const chatType = (ctx.chat && (ctx.chat as any).type) || '';
+  const userId = String(ctx.from?.id);
+  users = loadUsers();
+  const user = users[userId];
+  if (chatType !== 'private') {
+    return ctx.reply(t('common.reveal_private_only', userId));
+  }
+  if (user && hasWallet(user)) {
+    await ctx.reply(t('common.full_private_key', userId, { secret: user.secret }), { parse_mode: 'HTML' });
+  } else {
+    await ctx.reply(t('common.no_wallet', userId));
   }
 });
 
@@ -541,27 +878,34 @@ bot.action('create_or_change_wallet_inline', async (ctx) => {
     // Overwrite with a new generated wallet
     const keypair = generateKeypair();
     const secret = exportSecretKey(keypair);
+    // preserve existing wallet into wallets array, then set new as active
+    user.wallets = user.wallets || [];
+    try { user.wallets.push({ wallet: user.wallet, secret: user.secret, createdAt: Date.now() }); } catch (_) {}
     user.secret = secret;
     user.wallet = keypair.publicKey?.toBase58?.() || keypair.publicKey;
+    try { user.wallets.push({ wallet: user.wallet, secret: user.secret, createdAt: Date.now() }); } catch (_) {}
     users[userId] = user;
     saveUsers(users);
-  await ctx.reply(`✅ Wallet changed successfully!\nAddress: <code>${user.wallet}</code>`, { parse_mode: 'HTML' });
+  await ctx.reply(t('common.wallet_changed', userId, { address: escapeHtml(user.wallet) }), { parse_mode: 'HTML' });
     return;
   }
   // Create new wallet
   const keypair = generateKeypair();
   const secret = exportSecretKey(keypair);
   user.secret = secret;
-  user.wallet = keypair.publicKey?.toBase58?.() || keypair.publicKey;
+  const newWalletAddr = keypair.publicKey?.toBase58?.() || keypair.publicKey;
+  user.wallet = newWalletAddr;
+  user.wallets = user.wallets || [];
+  try { user.wallets.push({ wallet: newWalletAddr, secret, createdAt: Date.now() }); } catch (_) {}
   users[userId] = user;
   saveUsers(users);
-  await ctx.reply(`✅ Wallet created successfully!\nAddress: <code>${user.wallet}</code>`, { parse_mode: 'HTML' });
+  await ctx.reply(t('common.wallet_created', userId, { address: escapeHtml(user.wallet) }), { parse_mode: 'HTML' });
 });
 
 bot.action('restore_wallet_inline', async (ctx) => {
   const userId = String(ctx.from?.id);
   restoreStates[userId] = true;
-  await ctx.reply('🔑 Please send your wallet private key now in a private message (it will be received here).');
+  await ctx.reply(t('common.restore_prompt_private', userId));
 });
 
 bot.action('show_secret', async (ctx) => {
@@ -569,71 +913,26 @@ bot.action('show_secret', async (ctx) => {
   const userId = String(ctx.from?.id);
   const user = users[userId];
   if (user && hasWallet(user)) {
-    await ctx.reply('🔑 Your private key:\n<code>' + user.secret + '</code>', { parse_mode: 'HTML' });
+    const secret = String(user.secret || '');
+    const masked = secret ? (secret.length > 12 ? (secret.slice(0,6) + '...' + secret.slice(-6)) : ('***' + secret.slice(-6))) : 'N/A';
+    await ctx.reply(t('common.show_full_key_private_only', userId, { masked }), { parse_mode: 'HTML' });
+    await ctx.reply(t('common.reveal_prompt', userId), { reply_markup: { inline_keyboard: [ [ { text: '🔐 ' + t('common.reveal_prompt', userId), callback_data: 'reveal_full_secret' } ] ] } } as any);
   } else {
-    await ctx.reply('❌ No wallet registered. You can create one or restore it.');
+    await ctx.reply(t('common.no_wallet', userId));
   }
 });
 
-bot.hears('⚙️ Strategy', async (ctx) => {
-  console.log(`[⚙️ Strategy] User: ${String(ctx.from?.id)}`);
-  const userId = String(ctx.from?.id);
-  userStrategyStates[userId] = { step: 0, values: {} };
-  await ctx.reply('🚦 Strategy Setup:\nPlease enter the required value for each field. Send "skip" to skip any optional field.');
-  const field = STRATEGY_FIELDS[0];
-  await ctx.reply(`📝 ${field.label}${field.optional ? ' (optional)' : ''}`);
-});
 
-bot.hears('📊 Show Tokens', async (ctx) => {
-  console.log(`[📊 Show Tokens] User: ${String(ctx.from?.id)}`);
-  ctx.reply('To view tokens matching your strategy, use the /show_token command.');
-});
 
-bot.hears('🤝 Invite Friends', async (ctx) => {
-  console.log(`[🤝 Invite Friends] User: ${String(ctx.from?.id)}`);
-  const userId = String(ctx.from?.id);
-  const inviteLink = `https://t.me/${ctx.me}?start=${userId}`;
-  await ctx.reply(`🤝 Share this link to invite your friends:\n${inviteLink}`);
-});
-
-// New handler for central-exchange sniper button — prompt user to provide CEX API keys
-bot.hears('سنايبر المنصات المركزيه', async (ctx) => {
-  const userId = String(ctx.from?.id);
-  console.log(`[Sniper-CEX] CEX button pressed by User: ${userId}`);
-  try {
-    // Prefer private chat for sharing secrets
-    const chatType = (ctx.chat && (ctx.chat as any).type) || '';
-    if (chatType !== 'private') {
-      await ctx.reply('⚠️ For security, please send me CEX API keys in a private chat. Open a private chat with the bot and press this button again.');
-      return;
-    }
-    users = loadUsers();
-    // mark that we are expecting keys from this user next
-    const expecting = (globalThis as any).__expectingCexKeys as Set<string>;
-    expecting.add(userId);
-    const have = users[userId] && users[userId].cex ? 'You already have keys saved. Sending new keys will require CONFIRM to overwrite.' : '';
-    await ctx.reply(`📥 Please send your centralized-exchange API keys in the format:
-APIKEY:SECRET
-To run a one-time validation without saving, prefix with TEST: (example: TEST:APIKEY:SECRET)
-${have}\n
-After sending keys I will validate them with the exchange and then ${users[userId] && users[userId].cex ? 'ask you to CONFIRM before overwriting.' : 'save them automatically.'}`);
-  } catch (e) {
-    console.error('[Sniper-CEX] handler error', e);
-    try { await ctx.reply('❌ Failed to start CEX key prompt.'); } catch (_) {}
-  }
-});
-
-// Legacy/general Sniper handler (keyboard or text match)
-bot.hears(/(?:سنايبر|Sniper)(?:\s*\((\d+)\))?/, async (ctx) => {
+// Sniper handler extracted to function so it can be invoked from router (supports counts)
+async function handleSniper(ctx: any, explicitCount?: number) {
   console.log(`[Sniper] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   const user = users[userId] = users[userId] || {};
-  // If the button label was 'Sniper (N)', extract N; otherwise use user preference or default
   let maxCollect = 3;
   try {
-    const labelCount = ctx.match && ctx.match[1] ? Number(ctx.match[1]) : null;
-    if (labelCount && !isNaN(labelCount) && labelCount > 0) {
-      maxCollect = Math.max(1, Math.min(20, Math.floor(labelCount)));
+    if (explicitCount && !isNaN(Number(explicitCount)) && Number(explicitCount) > 0) {
+      maxCollect = Math.max(1, Math.min(20, Math.floor(Number(explicitCount))));
     } else {
       const v = user.listenerMaxCollect || (user.strategy && (user.strategy.listenerMaxCollect || user.strategy.maxCollect || user.strategy.maxTrades));
       const n = Number(v);
@@ -641,123 +940,101 @@ bot.hears(/(?:سنايبر|Sniper)(?:\s*\((\d+)\))?/, async (ctx) => {
     }
   } catch (e) {}
   const timeoutMs = Number(process.env.RUNNER_TIMEOUT_MS || 60000);
-  await ctx.reply(`🔎 Fetching latest ${maxCollect} fresh mint${maxCollect>1? 's' : ''} (this may take a few seconds)...`);
+  await ctx.reply(t('sniper.fetching', userId, { n: String(maxCollect) }));
   try{
-    // require sniper module and call collector
-  const sniperMod = require('./sniper.js');
+    const sniperMod = require('./sniper.js');
     if(!sniperMod || typeof sniperMod.collectFreshMints !== 'function'){
-      await ctx.reply('⚠️ Internal error: collectFreshMints function is not available on the server.');
+      await ctx.reply(t('sniper.collect_func_missing', userId));
       return;
     }
-  console.error(`[Sniper] request user=${userId} maxCollect=${maxCollect} timeoutMs=${timeoutMs}`);
-  let res = await sniperMod.collectFreshMints({ maxCollect, timeoutMs });
-  console.error(`[Sniper] initial resultCount=${(res && Array.isArray(res)) ? res.length : 'err'}`);
-    // If empty, try one retry with longer timeout (to reduce false negatives)
-    if(!res || !Array.isArray(res) || res.length===0){
+    console.error(`[Sniper] request user=${userId} maxCollect=${maxCollect} timeoutMs=${timeoutMs}`);
+    let res = await sniperMod.collectFreshMints({ maxCollect, timeoutMs });
+    console.error(`[Sniper] initial resultCount=${(res && Array.isArray(res)) ? res.length : 'err'}`);
+      if(!res || !Array.isArray(res) || res.length===0){
       const retryTimeout = Math.min(Number(process.env.RUNNER_TIMEOUT_MS || 60000) * 2, 120000);
       console.error(`[Sniper] initial empty - retrying with timeoutMs=${retryTimeout} for user=${userId}`);
-      try{
-        await ctx.reply('ℹ️ No immediate mints found — retrying with a longer timeout.');
-      }catch(_){ }
+      try{ await ctx.reply(t('sniper.retrying', userId)); } catch(_) {}
       res = await sniperMod.collectFreshMints({ maxCollect, timeoutMs: retryTimeout });
       console.error(`[Sniper] retry resultCount=${(res && Array.isArray(res)) ? res.length : 'err'}`);
       if(!res || !Array.isArray(res) || res.length===0){
-        await ctx.reply('ℹ️ No fresh mints were found in both attempts. The network may be quiet or RPC limits applied. Try again later or increase RUNNER_TIMEOUT_MS.');
+        await ctx.reply(t('sniper.no_mints', userId));
         return;
       }
     }
-    // Instead: send a short status message per token and run simulation-only background tasks.
+    // Build and send messages
     try {
-      // Build and send the combined token message (no simulation details)
       const botUsername = bot.botInfo?.username || process.env.BOT_USERNAME || 'YourBotUsername';
       users = loadUsers();
       const userObj = users && users[userId] ? users[userId] : {};
       const limit = Math.min(maxCollect, Array.isArray(res) ? res.length : 0);
-
-      // Build a concise combined message and add a per-token share button (deep link)
       let combinedMsg = '';
       const combinedKeyboard: any[] = [];
       const botUsernameSafe = escapeHtml(botUsername || String(process.env.BOT_USERNAME || ''));
-      for (let i = 0; i < limit; i++) {
+    for (let i = 0; i < limit; i++) {
         const tok = res[i];
         try {
           const mint = tok && (tok.tokenAddress || tok.address || tok.mint) ? (tok.tokenAddress || tok.address || tok.mint) : String(tok);
           const name = tok && (tok.name || tok.symbol) ? escapeHtml(tok.name || tok.symbol) : escapeHtml(mint);
           const priceSol = tok && (tok.priceSol || tok.price || tok.priceUsd) ? String(tok.priceSol || tok.price || tok.priceUsd) : '-';
-          // One-liner per token: • Name — <code>mint</code> — price
           if (combinedMsg) combinedMsg += '\n';
           combinedMsg += `• <b>${name}</b> — <code>${escapeHtml(mint)}</code> — <i>${escapeHtml(priceSol)}</i>`;
-
-          // Inline buttons: Buy (callback), Sell (callback), Share (opens Telegram share dialog)
-          // Prefill share text with token name, mint and a deep-link back to bot start for context
           const deepLink = `https://t.me/${botUsernameSafe}?start=share_${encodeURIComponent(String(userId))}_${encodeURIComponent(String(mint))}`;
           const shareText = encodeURIComponent(`${name} - ${mint}\n${deepLink}`);
           const shareUrl = `https://t.me/share/url?text=${shareText}`;
           const row: any[] = [
-            { text: '🛒 Buy', callback_data: `buy_${mint}` },
-            { text: '🔻 Sell', callback_data: `sell_${mint}` },
-            { text: '🔗 Share', url: shareUrl }
+            { text: '🛒 ' + t('buy.button', userId), callback_data: `buy_${mint}` },
+            { text: '🔻 ' + t('sell.button', userId), callback_data: `sell_${mint}` },
+            { text: '🔗 ' + t('common.share', userId), url: shareUrl }
           ];
           combinedKeyboard.push(row);
-          } catch (err) {
+        } catch (err) {
           console.error('[Sniper->build] token build failed', err);
         }
       }
-
       if (combinedMsg) {
-          try {
+        try {
           const replyMarkup: any = { inline_keyboard: combinedKeyboard };
           await bot.telegram.sendMessage(Number(userId) || userId, combinedMsg, { parse_mode: 'HTML', reply_markup: replyMarkup } as any);
         } catch (sendErr) {
-          try {
-            await ctx.replyWithHTML(`<pre>${escapeHtml(JSON.stringify(res, null, 2))}</pre>`, { disable_web_page_preview: true } as any);
-          } catch (e2) { console.error('[Sniper->send] final fallback failed', e2); }
+          try { await ctx.replyWithHTML(`<pre>${escapeHtml(JSON.stringify(res, null, 2))}</pre>`, { disable_web_page_preview: true } as any); } catch (e2) { console.error('[Sniper->send] final fallback failed', e2); }
         }
       } else {
-        try {
-          await ctx.replyWithHTML(`<pre>${escapeHtml(JSON.stringify(res, null, 2))}</pre>`, { disable_web_page_preview: true } as any);
-  } catch (e) { console.error('[Sniper->send] fallback failed', e); }
+        try { await ctx.replyWithHTML(`<pre>${escapeHtml(JSON.stringify(res, null, 2))}</pre>`, { disable_web_page_preview: true } as any); } catch (e) { console.error('[Sniper->send] fallback failed', e); }
       }
-
-      // Run a single simulate-only autoExecute for all collected tokens (listenerBypass)
-      // This avoids spawning per-token tasks and duplicate notifications, and allows
-      // the executor to perform immediate live buys when simulation succeeds.
       (async () => {
         try {
           const tokensToHandle = res.slice(0, limit).map((tok: any) => ({ mint: tok.tokenAddress || tok.address || tok.mint || tok.pairAddress || String(tok), createdAt: tok.firstBlockTime || tok.firstBlock || null, __listenerCollected: true }));
           await autoExecuteStrategyForUser(userObj, tokensToHandle, 'buy', { simulateOnly: true, listenerBypass: true });
-          } catch (bgErr) {
-          console.error('[Sniper->autoExec background error]', bgErr ? (bgErr instanceof Error ? bgErr.message : String(bgErr)) : 'unknown');
-        }
+        } catch (bgErr) { console.error('[Sniper->autoExec background error]', bgErr ? (bgErr instanceof Error ? bgErr.message : String(bgErr)) : 'unknown'); }
       })();
       return;
-    } catch (e: any) {
+      } catch (e: any) {
       console.error('[Sniper->send] background-sim handler failed', e ? (e instanceof Error ? e.message : String(e)) : 'unknown');
-      try { await ctx.reply('❌ Error processing results. Check server logs.'); } catch (_) {}
+      try { await ctx.reply(t('common.error_processing_results', userId)); } catch (_) {}
     }
-  }catch(e){
+  } catch (e) {
     console.error('Sniper collector error', (e as any) && (e as any).message || e);
-    try{ await ctx.reply('❌ Error fetching mints. Check server logs.'); }catch(_){ }
+    try{ await ctx.reply(t('common.error_fetching_mints', userId)); }catch(_){ }
   }
-});
+}
 
 // Allow users to set preferred number of mints returned by the button
 bot.command('set_mints', async (ctx) => {
   const userId = String(ctx.from?.id);
   const parts = ctx.message.text.split(' ').map(s=>s.trim()).filter(Boolean);
   if(parts.length < 2){
-    await ctx.reply('Usage: /set_mints <N> — set the number of mints you want returned when pressing Sniper (example: /set_mints 3)');
+    await ctx.reply(t('commands.set_mints_usage', userId));
     return;
   }
   const n = Number(parts[1]);
   if(isNaN(n) || n <= 0 || n > 20){
-    await ctx.reply('Please enter a valid number between 1 and 20.');
+    await ctx.reply(t('commands.invalid_number', userId));
     return;
   }
   users[userId] = users[userId] || {};
   users[userId].listenerMaxCollect = n;
   saveUsers(users);
-  await ctx.reply(`✅ Number of mints set to ${n}. Press Sniper to see the latest ${n} fresh mints.`);
+  await ctx.reply(t('commands.mints_set', userId, { n: String(n) }));
 });
 
 bot.command('notify_tokens', async (ctx) => {
@@ -765,7 +1042,7 @@ bot.command('notify_tokens', async (ctx) => {
   const userId = String(ctx.from?.id);
   const user = users[userId];
   if (!user || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('❌ You must set a strategy first using /strategy');
+    await ctx.reply(t('common_extra.no_strategy_or_wallet', userId));
     return;
   }
   const now = Date.now();
@@ -775,11 +1052,11 @@ bot.command('notify_tokens', async (ctx) => {
   }
   const filteredTokens = filterTokensByStrategy(globalTokenCache, user.strategy);
   if (!filteredTokens.length) {
-    await ctx.reply('No tokens currently match your strategy.');
+    await ctx.reply(t('main.no_tokens_match', userId));
     return;
   }
   await notifyUsers(ctx.telegram, { [userId]: user }, filteredTokens);
-  await ctx.reply('✅ Notification sent for tokens matching your strategy.');
+  await ctx.reply(t('main.notifications_sent', userId));
 });
 
 
@@ -790,22 +1067,22 @@ bot.action(/buy_(.+)/, async (ctx: any) => {
   const tokenAddress = ctx.match[1];
   console.log(`[buy] User: ${userId}, Token: ${tokenAddress}`);
   if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('❌ No active strategy or wallet found.');
+    await ctx.reply(t('common_extra.no_strategy_or_wallet', userId));
     return;
   }
   try {
     const amount = Number(user.strategy && user.strategy.buyAmount);
     if (!amount || isNaN(amount) || amount <= 0) {
-      await ctx.reply('❌ Your strategy does not have a valid buy amount configured. Please set `buyAmount` in your strategy or use the Settings to configure the buy amount before using the Buy button.', { parse_mode: 'Markdown' });
+      await ctx.reply(t('buy.invalid_buy_amount', userId), { parse_mode: 'Markdown' });
       return;
     }
-    await ctx.reply(`🛒 Buying token: <code>${tokenAddress}</code> with amount: <b>${amount}</b> SOL ...`, { parse_mode: 'HTML' });
+    await ctx.reply(t('buy.buying_token', userId, { token: tokenAddress, amount: String(amount) }), { parse_mode: 'HTML' });
       let result: any;
       try {
         result = await unifiedBuy(tokenAddress, amount, user.secret);
       } catch (err: any) {
         const msg = err && err.message ? String(err.message) : String(err);
-        await ctx.reply('❌ Purchase cancelled: ' + msg);
+        await ctx.reply(t('buy.purchase_cancelled', userId, { msg }));
         console.error('buy error:', err);
         return;
       }
@@ -819,12 +1096,12 @@ bot.action(/buy_(.+)/, async (ctx: any) => {
       limitHistory(user);
       saveUsers(users);
       registerBuyWithTarget(user, { address: tokenAddress }, result, user.strategy.targetPercent || 10);
-      await ctx.reply(`Token bought successfully!\nAuto-sell order placed for profit target ${(user.strategy.targetPercent || 10)}%.\nCheck your orders with /pending_sells`);
+      await ctx.reply(t('buy.success', userId, { percent: String(user.strategy.targetPercent || 10) }));
     } else {
-      await ctx.reply('Buy failed: Transaction was not completed.');
+      await ctx.reply(t('buy.failed_tx', userId));
     }
   } catch (e) {
-    await ctx.reply('❌ Error during buy: ' + getErrorMessage(e));
+    await ctx.reply(t('buy.error', userId, { err: getErrorMessage(e) }));
     console.error('buy error:', e);
   }
 });
@@ -845,14 +1122,14 @@ bot.action(/sell_(.+)/, async (ctx: any) => {
   const tokenAddress = ctx.match[1];
   console.log(`[sell] User: ${userId}, Token: ${tokenAddress}`);
   if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('❌ No active strategy or wallet found.');
+    await ctx.reply(t('common_extra.no_strategy_or_wallet', userId));
     return;
   }
   try {
     const sellPercent = user.strategy.sellPercent1 || 100;
     const balance = await getUserTokenBalance(user, tokenAddress);
     const amount = (balance * sellPercent) / 100;
-    await ctx.reply(`🔻 Selling token: <code>${tokenAddress}</code> with <b>${sellPercent}%</b> of your balance (${balance}) ...`, { parse_mode: 'HTML' });
+  await ctx.reply(t('sell.selling_token', userId, { token: tokenAddress, percent: String(sellPercent), balance: String(balance) }), { parse_mode: 'HTML' });
     const result = await unifiedSell(tokenAddress, amount, user.secret);
     const sellTx = extractTx(result);
     if (sellTx) {
@@ -861,12 +1138,12 @@ bot.action(/sell_(.+)/, async (ctx: any) => {
       user.history.push(entry);
       limitHistory(user);
       saveUsers(users);
-      await ctx.reply('Token sold successfully!');
+      await ctx.reply(t('sell.success', userId));
     } else {
-      await ctx.reply('Sell failed: Transaction was not completed.');
+      await ctx.reply(t('sell.failed_tx', userId));
     }
   } catch (e: any) {
-    await ctx.reply(`❌ Error during sell: ${getErrorMessage(e)}`);
+    await ctx.reply(t('sell.error', userId, { err: getErrorMessage(e) }));
     console.error('sell error:', e);
   }
 });
@@ -877,9 +1154,11 @@ bot.command('wallet', async (ctx) => {
   const userId = String(ctx.from?.id);
   const user = users[userId];
   if (user && hasWallet(user)) {
-    await ctx.reply('🔑 Your wallet private key:\n' + user.secret);
+    const secret = String(user.secret || '');
+    const masked = secret ? (secret.length > 12 ? (secret.slice(0,6) + '...' + secret.slice(-6)) : ('***' + secret.slice(-6))) : 'N/A';
+    await ctx.reply(t('wallet_msgs.masked_message', userId, { masked }), walletKeyboard());
   } else {
-    await ctx.reply('❌ No wallet found for this user.', walletKeyboard());
+    await ctx.reply(t('wallet_msgs.no_wallet_found', userId), walletKeyboard());
   }
 });
 
@@ -911,7 +1190,10 @@ bot.command(['create_wallet', 'restore_wallet'], async (ctx) => {
     secret = exportSecretKey(keypair);
   }
   user.secret = secret;
-  user.wallet = keypair.publicKey?.toBase58?.() || keypair.publicKey;
+  const newWalletAddr = keypair.publicKey?.toBase58?.() || keypair.publicKey;
+  user.wallet = newWalletAddr;
+  user.wallets = user.wallets || [];
+  try { user.wallets.push({ wallet: newWalletAddr, secret, createdAt: Date.now() }); } catch (_) {}
   saveUsers(users);
   await ctx.reply('✅ Wallet ' + (ctx.message.text.startsWith('/restore_wallet') ? 'restored' : 'created') + ' successfully!\nAddress: <code>' + user.wallet + '</code>\nPrivate key (keep it safe): <code>' + user.secret + '</code>', { parse_mode: 'HTML' });
 });
@@ -973,7 +1255,10 @@ bot.action('create_wallet', async (ctx) => {
   const keypair = generateKeypair();
   const secret = exportSecretKey(keypair);
   user.secret = secret;
-  user.wallet = keypair.publicKey?.toBase58?.() || keypair.publicKey;
+  const newWalletAddr = keypair.publicKey?.toBase58?.() || keypair.publicKey;
+  user.wallet = newWalletAddr;
+  user.wallets = user.wallets || [];
+  try { user.wallets.push({ wallet: newWalletAddr, secret, createdAt: Date.now() }); } catch (_) {}
   saveUsers(users);
   await ctx.reply(`✅ Wallet created successfully!\nAddress: <code>${user.wallet}</code>\nPrivate key (keep it safe): <code>${user.secret}</code>`, { parse_mode: 'HTML' });
 });
@@ -982,7 +1267,7 @@ bot.action('restore_wallet', async (ctx) => {
   console.log(`[restore_wallet] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   restoreStates[userId] = true;
-  await ctx.reply('🔑 Please send your wallet private key in a private message now:');
+  await ctx.reply(t('common.restore_prompt_private', userId));
 });
 
 bot.on('text', async (ctx, next) => {
@@ -993,15 +1278,19 @@ bot.on('text', async (ctx, next) => {
     try {
       const keypair = parseKey(secret);
       let user = users[userId] || {};
-      user.secret = exportSecretKey(keypair);
-      user.wallet = keypair.publicKey?.toBase58?.() || keypair.publicKey;
+      const exported = exportSecretKey(keypair);
+      const walletAddr = keypair.publicKey?.toBase58?.() || keypair.publicKey;
+      user.secret = exported;
+      user.wallet = walletAddr;
+      user.wallets = user.wallets || [];
+      try { user.wallets.push({ wallet: walletAddr, secret: exported, createdAt: Date.now() }); } catch (_) {}
       users[userId] = user;
       saveUsers(users);
       delete restoreStates[userId];
 
-      await ctx.reply(`✅ Wallet restored successfully!\nAddress: <code>${user.wallet}</code>\nPrivate key (keep it safe): <code>${user.secret}</code>`, { parse_mode: 'HTML' });
+  await ctx.reply(t('common.wallet_restored_success', userId, { address: user.wallet, secret: user.secret }), { parse_mode: 'HTML' });
           } catch {
-            await ctx.reply('❌ Failed to restore wallet. Invalid key. Try again or create a new wallet.');
+    await ctx.reply(t('common.restore_failed_invalid', userId));
           }
           return;
         }
@@ -1010,13 +1299,7 @@ bot.on('text', async (ctx, next) => {
 
       const userStrategyStates: Record<string, { step: number, values: Record<string, any>, phase?: string, tradeSettings?: Record<string, any> }> = {};
 
-      bot.hears('⚙️ Strategy', async (ctx) => {
-        const userId = String(ctx.from?.id);
-        userStrategyStates[userId] = { step: 0, values: {} };
-        await ctx.reply('🚦 Strategy Setup:\nPlease enter the required value for each field. Send "skip" to skip any optional field.');
-        const field = STRATEGY_FIELDS[0];
-        await ctx.reply(`📝 ${field.label}${field.optional ? ' (optional)' : ''}`);
-      });
+      // Strategy flow is handled by the central text router above; no duplicate hears here.
 
       bot.on('text', async (ctx, next) => {
         const userId = String(ctx.from?.id);

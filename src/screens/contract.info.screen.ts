@@ -88,7 +88,7 @@ import {
 } from "../raydium/raydium.service";
 import { getCoinData } from "../pump/api";
 // TokenSecurityInfoDataType not required in stub
-
+ 
 export const inline_keyboards = [
   [{ text: "🖼 Generate PNL Card", command: "pnl_card" }],
   [
@@ -409,11 +409,11 @@ const getRaydiumTokenInfoCaption = async (
       clmmKeys
     )) as QuoteRes;
 
-    const quote = splbalance > 0 ? quoteTemp : null;
+  const quote = splbalance > 0 ? (quoteTemp as any) : null;
 
-    const priceInSOL = quoteTemp.priceInSol; //  await getPriceInSOL(mint);
-    const priceInUsd = (priceInSOL ?? 0) * solprice;
-    const priceImpact = quote ? quote.priceImpactPct : 0;
+  const priceInSOL = (quoteTemp as any) && ((quoteTemp as any).priceInSol ?? (quoteTemp as any).priceInSOL);
+  const priceInUsd = (priceInSOL ?? 0) * solprice;
+  const priceImpact = quote && typeof (quote as any).priceImpactPct === 'number' ? (quote as any).priceImpactPct : 0;
 
     const supply = Number(metadata.parsed.info.supply) / 10 ** Number(decimals);
     // const liquidity = baseBalance;
@@ -499,7 +499,7 @@ const getJupiterTokenInfoCaption = async (
             9
           )
         : null;
-    const priceImpact = quote ? quote.priceImpactPct : 0;
+  const priceImpact = quote && typeof (quote as any).priceImpactPct === 'number' ? (quote as any).priceImpactPct : 0;
 
     console.log("Jupiter Quote", quote);
 

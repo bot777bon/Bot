@@ -242,10 +242,11 @@ function _maybeEncrypt(text: string) {
 }
 function _maybeDecrypt(token: string) {
   if (_fernet) {
-    try { return _fernet.decrypt(String(token)); } catch (e) { return null; }
+    try { return _fernet.decrypt(String(token)); } catch (e) { return String(token); }
   }
   return String(token);
 }
+
 async function cryptoAddUser(chatId: string, apiKey: string, apiSecret: string) {
   try {
     users = loadUsers();
@@ -320,6 +321,8 @@ if (!(globalThis as any).__pendingPartial) (globalThis as any).__pendingPartial 
 // Expectation sets for CEX interactive flows
 if (!(globalThis as any).__expectingCexTokenAnalysis) (globalThis as any).__expectingCexTokenAnalysis = new Set<string>();
 if (!(globalThis as any).__expectingCexTradeRequest) (globalThis as any).__expectingCexTradeRequest = new Set<string>();
+// Expecting set for live-enable configuration (number of trades and buy amount)
+if (!(globalThis as any).__expectingCexLiveConfig) (globalThis as any).__expectingCexLiveConfig = new Set<string>();
 
 // Dedicated text handler for API key storage (CONFIRM/CANCEL and APIKEY:SECRET)
 bot.on('text', async (ctx, next) => {
@@ -520,6 +523,52 @@ bot.on('text', async (ctx, next) => {
         const cex = require('./cexSniper.js');
         cex.addTradeRecord(chatId, { action: 'trade_request', details: text });
       } catch (e: any) { console.error('trade request error', e); }
+      return;
+    }
+    // If user is expected to send live-enable configuration (trades and buy amount)
+    const expectingLive = (globalThis as any).__expectingCexLiveConfig as Set<string>;
+    if (expectingLive && expectingLive.has(chatId)) {
+      // single-message formats supported: "<trades> <amount>", "trades:<amount>", "<trades>,<amount>"
+      expectingLive.delete(chatId);
+      const raw = String(text).trim();
+      let trades: number | null = null;
+      let amount: number | null = null;
+      try {
+        // try space or comma separated
+        if (raw.includes(' ') || raw.includes(',')) {
+          const parts = raw.split(/[,\s]+/).filter(Boolean);
+          if (parts.length >= 2) {
+            trades = parseInt(parts[0], 10);
+            amount = parseFloat(parts[1]);
+          }
+        } else if (raw.includes(':')) {
+          const p = raw.split(':').map(s => s.trim());
+          trades = parseInt(p[0], 10);
+          amount = parseFloat(p[1]);
+        } else {
+          // single number -> treat as buy amount with 1 trade
+          const v = parseFloat(raw);
+          if (!isNaN(v)) { trades = 1; amount = v; }
+        }
+      } catch (e) { /* fallthrough to validation error */ }
+      if (!trades || trades <= 0 || !amount || amount <= 0 || isNaN(trades) || isNaN(amount)) {
+        try { await ctx.reply(t('cex.live_config_invalid', chatId)); } catch (_) {}
+        return;
+      }
+      // start cex sniper in live mode with parsed options
+      try {
+        const keys = await cryptoGetUserKeys(chatId);
+        if (!keys) return ctx.reply(t('cex.no_keys_saved', chatId));
+        const cex = require('./cexSniper.js');
+        const usersLocal = loadUsers();
+        const platform = (usersLocal[chatId] && usersLocal[chatId].cex && usersLocal[chatId].cex.platform) ? usersLocal[chatId].cex.platform : 'BINANCE';
+        const res = await cex.startUserCexSniper(chatId, { apiKey: keys.apiKey, apiSecret: keys.apiSecret, platform }, { live: true, trades: trades, buyAmount: amount });
+        if (res && res.ok) {
+          await ctx.reply(t('cex.live_enabled_with_opts', chatId, { trades: String(trades), amount: String(amount) }));
+        } else {
+          await ctx.reply(t('cex.live_enable_failed', chatId, { err: (res && res.err ? String(res.err) : 'unknown') }));
+        }
+      } catch (e: any) { console.error('live enable start error', e); try { await ctx.reply(t('cex.live_enable_failed', chatId, { err: (e && e.message) || String(e) })); } catch (_) {} }
       return;
     }
   if (String(text).toUpperCase() === 'CONFIRM') {
@@ -1246,12 +1295,9 @@ bot.action('cex_enable_live', async (ctx) => {
   try {
     const keys = await cryptoGetUserKeys(userId);
     if (!keys) return ctx.reply(t('cex.no_keys_saved', userId));
-    const cex = require('./cexSniper.js');
-    const res = await cex.startUserCexSniper(userId, { apiKey: keys.apiKey, apiSecret: keys.apiSecret, platform: (users[userId] && users[userId].cex && users[userId].cex.platform) || 'BINANCE' }, { live: true });
-    if (res && res.ok) {
-      return ctx.reply(t('cex.live_enabled', userId));
-    }
-    return ctx.reply(t('cex.live_enable_failed', userId, { err: (res && res.err ? String(res.err) : 'unknown') }));
+    // ask user for configuration: number of trades and buy amount per trade
+    try { (globalThis as any).__expectingCexLiveConfig.add(userId); } catch (_) {}
+    return ctx.reply(t('cex.prompt_live_config', userId) + '\n' + t('cex.prompt_live_config_example', userId));
   } catch (e: any) { console.error('cex_enable_live error', e); return ctx.reply('خطأ أثناء تفعيل التداول الحي: ' + (e && e.message ? e.message : String(e))); }
 });
 

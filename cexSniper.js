@@ -33,9 +33,31 @@ function startUserCexSniper(userId, keys, opts) {
   const liveFlag = Boolean(opts && (opts).live);
   /** @type {any} */
   const meta = /** @type {any} */ ({ startedAt: Date.now(), keys: { ...keys }, opts: opts || {}, live: liveFlag });
-  // If live requested, attach a placeholder ccxt client field (not performing real orders here)
+  // If live requested, attempt to attach a ccxt client (if ccxt is installed)
   if (meta.live) {
-    meta.client = null; // placeholder for future ccxt client instance
+    try {
+      // lazy require so dependency is optional until used
+      const ccxt = require('ccxt');
+      const platformId = String((keys.platform || 'binance')).toLowerCase();
+      // normalize some common names
+      const map = { 'mexc': 'mexc', 'mexC': 'mexc', 'binance': 'binance', 'bybit': 'bybit' };
+  let mapped;
+  try { mapped = map[platformId]; } catch (e) { mapped = undefined; }
+  const id = (mapped || platformId).toLowerCase();
+      if (ccxt && ccxt[id]) {
+        try {
+          meta.client = new ccxt[id]({ apiKey: keys.apiKey, secret: keys.apiSecret, enableRateLimit: true });
+        } catch (e) {
+          meta.client = null;
+          console.error('cexSniper: failed to init ccxt client for', id, e);
+        }
+      } else {
+        meta.client = null;
+      }
+    } catch (e) {
+      meta.client = null;
+      // ccxt not installed or other error
+    }
   }
   running.set(String(userId), meta);
   return { ok: true, msg: meta.live ? 'CEX sniper started in LIVE mode (orders disabled until fully implemented).' : 'CEX sniper started (simulation). This module currently runs in dry-run mode by default.' };
@@ -183,10 +205,39 @@ async function executeOrder(userId, symbol, side, usdtSize, keys, opts) {
     // record attempt
     addTradeRecord(userId, { action: 'execute_attempt', symbol, side, usdtSize, enabled });
     if (!enabled) return { ok: false, simulated: true, msg: 'execution_disabled' };
-    // Real execution would create a ccxt client per user and place market order.
-    // For now, return a stubbed success to keep safe.
-    addTradeRecord(userId, { action: 'execute_record', symbol, side, usdtSize, note: 'STUBBED_SUCCESS' });
-    return { ok: true, simulated: false, note: 'stubbed_success' };
+    // If enabled, try to perform a real market order using user's client
+    try {
+      const meta = running.get(String(userId));
+      const client = meta && meta.client;
+      if (!client) {
+        addTradeRecord(userId, { action: 'execute_failed', reason: 'no_client' });
+        return { ok: false, err: 'no_client' };
+      }
+      // We need to determine amount in base currency. Many CEXs accept amount in base units.
+      // Simplest approach: fetch ticker price and compute amount = usdtSize / price
+      const ticker = await client.fetchTicker(symbol);
+      const price = Number(ticker && (ticker.last || ticker.close || ticker.price));
+      if (!price || isNaN(price) || price <= 0) {
+        addTradeRecord(userId, { action: 'execute_failed', reason: 'bad_price', ticker });
+        return { ok: false, err: 'bad_price' };
+      }
+      const amount = Number((Number(usdtSize) / price).toFixed(8));
+      // place market order
+      let order;
+      if (typeof client.createMarketOrder === 'function') {
+        order = await client.createMarketOrder(symbol, side, amount);
+      } else if (typeof client.createOrder === 'function') {
+        order = await client.createOrder(symbol, 'market', side, amount);
+      } else {
+        addTradeRecord(userId, { action: 'execute_failed', reason: 'no_order_method' });
+        return { ok: false, err: 'no_order_method' };
+      }
+      addTradeRecord(userId, { action: 'execute_record', symbol, side, usdtSize, amount, order });
+      return { ok: true, simulated: false, order };
+    } catch (e) {
+      addTradeRecord(userId, { action: 'execute_error', err: String(e) });
+      return { ok: false, err: String(e) };
+    }
   } catch (e) { return { ok: false, err: String(e) }; }
 }
 

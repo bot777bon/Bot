@@ -33,6 +33,58 @@ console.log('--- Telegraf instance created ---');
 function escapeHtml(str: string){
   return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+function fmtNum(n: any, digits=4) {
+  try {
+    if (n === null || n === undefined) return 'n/a';
+    const num = Number(n);
+    if (Math.abs(num) >= 1000) return num.toLocaleString(undefined, { maximumFractionDigits: 0 });
+    if (Math.abs(num) >= 1) return num.toLocaleString(undefined, { maximumFractionDigits: digits });
+    return num.toPrecision(Math.min(6, digits));
+  } catch (e) { return String(n); }
+}
+function humanVol(v: any) {
+  try {
+    const n = Number(v);
+    if (isNaN(n)) return String(v);
+    if (Math.abs(n) >= 1e9) return (n/1e9).toFixed(2) + 'B';
+    if (Math.abs(n) >= 1e6) return (n/1e6).toFixed(2) + 'M';
+    if (Math.abs(n) >= 1e3) return (n/1e3).toFixed(2) + 'K';
+    return n.toString();
+  } catch (e) { return String(v); }
+}
+
+// Map analyzer English advice phrases to translation keys so we can show localized advice
+function localizeAdvice(userId: string, adviceArr: any[]) {
+  if (!Array.isArray(adviceArr) || adviceArr.length === 0) return [];
+  const mapping: Array<{match:string, key:string}> = [
+    { match: 'Trend is bullish on the selected timeframe.', key: 'cex.advice_trend_bull' },
+    { match: 'RSI high -> consider risk of short-term pullback.', key: 'cex.advice_rsi_high' },
+    { match: 'High volatility detected; prefer smaller position sizes.', key: 'cex.advice_high_volatility' },
+    { match: 'Trend is bearish. Prefer wait-or-short strategies.', key: 'cex.advice_trend_bear' },
+    { match: 'RSI oversold -> short-term bounce possible.', key: 'cex.advice_rsi_oversold' },
+    { match: 'Market mixed: consider waiting for clearer confirmation or use reduced size.', key: 'cex.advice_mixed' },
+    { match: 'Volume is above recent average — move has momentum.', key: 'cex.advice_volume_high' },
+    { match: 'Volume is well below recent average — move lacks conviction.', key: 'cex.advice_volume_low' },
+    { match: 'No advice available', key: 'cex.advice_none' }
+  ];
+  const out: string[] = [];
+  for (const a of adviceArr) {
+    const s = String(a || '').trim();
+    let found = false;
+    for (const m of mapping) {
+      if (s === m.match || s.indexOf(m.match) !== -1) {
+        out.push(t(m.key, userId));
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      // fallback: return original (escaped) string so user still sees content
+      out.push(escapeHtml(s));
+    }
+  }
+  return out;
+}
 function escapeRegex(s: string) {
   return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -265,6 +317,9 @@ if (!(globalThis as any).__pendingKeys) (globalThis as any).__pendingKeys = new 
 if (!(globalThis as any).__expectingCexKeys) (globalThis as any).__expectingCexKeys = new Set<string>();
 // partial entries: if user sends APIKEY then SECRET in separate messages
 if (!(globalThis as any).__pendingPartial) (globalThis as any).__pendingPartial = new Map<string, { k?: string, s?: string }>();
+// Expectation sets for CEX interactive flows
+if (!(globalThis as any).__expectingCexTokenAnalysis) (globalThis as any).__expectingCexTokenAnalysis = new Set<string>();
+if (!(globalThis as any).__expectingCexTradeRequest) (globalThis as any).__expectingCexTradeRequest = new Set<string>();
 
 // Dedicated text handler for API key storage (CONFIRM/CANCEL and APIKEY:SECRET)
 bot.on('text', async (ctx, next) => {
@@ -311,6 +366,161 @@ bot.on('text', async (ctx, next) => {
           }
         }
       }
+    }
+    // If user is expected to send a token for analysis
+    const expectingAnalysis = (globalThis as any).__expectingCexTokenAnalysis as Set<string>;
+    if (expectingAnalysis && expectingAnalysis.has(chatId)) {
+      // treat the entire text as the token identifier and run analysis
+      expectingAnalysis.delete(chatId);
+      try {
+        const cex = require('./cexSniper.js');
+  await ctx.reply(t('cex.analysis_running', chatId));
+  // try to detect user's saved platform and pass to analyzer
+  users = loadUsers();
+  const u = users[chatId] || {};
+  const platform = (u.cex && u.cex.platform) ? u.cex.platform : undefined;
+  const res = await cex.analyzeSymbol(chatId, text, { platform });
+        if (!res || !res.ok) {
+          console.error('analysis failed', res);
+          await ctx.reply(t('cex.analysis_failed', chatId, { symbol: text, err: (res && (res.err || res.stderr)) || 'no_output' }));
+          return;
+        }
+        // format summary from res.data (enriched)
+        const data = res.data || {};
+        // If analyzer returned an error (e.g. symbol not found), reply with a clear message
+        if (data && data.error) {
+          try {
+            await ctx.reply(t('cex.analysis_symbol_not_found', chatId, { symbol: String(text), err: String(data.error) }));
+          } catch (e) {}
+          // still record the failed analysis
+          try { cex.addTradeRecord(chatId, { action: 'analyze_result_error', symbol: text, err: data.error }); } catch (_) {}
+          return;
+        }
+        // build an HTML message with key fields
+        const lines: string[] = [];
+        lines.push(`<b>🔎 ${escapeHtml(String(data.symbol || text))} — ${escapeHtml(String(data.timeframe || ''))}</b>`);
+        lines.push(`<b>${t('cex.analysis_signal', chatId)}:</b> ${escapeHtml(String(data.signal || 'n/a'))}  |  <b>${t('cex.analysis_score', chatId)}:</b> ${escapeHtml(String(data.score !== undefined ? String(data.score) : 'n/a'))}`);
+        if (Array.isArray(data.rationale) && data.rationale.length) {
+          lines.push(`<b>${t('cex.analysis_rationale', chatId)}:</b> ${escapeHtml(data.rationale.join(', '))}`);
+        }
+        if (data.indicators) {
+          const ind = data.indicators;
+          const indParts: string[] = [];
+          if (ind.EMA50 !== undefined) indParts.push(`EMA50:${escapeHtml(String(ind.EMA50))}`);
+          if (ind.EMA200 !== undefined) indParts.push(`EMA200:${escapeHtml(String(ind.EMA200))}`);
+          if (ind.MACD !== undefined) indParts.push(`MACD:${escapeHtml(String(ind.MACD))}`);
+          if (ind.MACD_hist !== undefined) indParts.push(`MACD_hist:${escapeHtml(String(ind.MACD_hist))}`);
+          if (ind.StochRSI !== undefined) indParts.push(`StochRSI:${escapeHtml(String(ind.StochRSI))}`);
+          if (indParts.length) lines.push(`<b>${t('cex.analysis_indicators', chatId)}:</b> ${escapeHtml(indParts.join(' | '))}`);
+        }
+        // ATR, prices, volumes
+        const atrText = (data.atr !== undefined && data.atr !== null) ? String(data.atr) : 'n/a';
+        const atrPctText = (data.atr_pct !== undefined && data.atr_pct !== null) ? (Number(data.atr_pct) * 100).toFixed(2) + '%' : 'n/a';
+        lines.push(`<b>${t('cex.analysis_price', chatId)}:</b> ${escapeHtml(String(data.close || 'n/a'))}  (<b>${t('cex.analysis_change', chatId)}:</b> ${escapeHtml(String(data.close_change !== undefined && data.close_change !== null ? (Number(data.close_change)*100).toFixed(2)+'%' : 'n/a'))})`);
+        // sparkline (if provided)
+        if (data.sparkline) {
+          lines.push(`<code>${escapeHtml(String(data.sparkline))}</code>`);
+        }
+        lines.push(`<b>${t('cex.analysis_atr', chatId)}:</b> ${escapeHtml(atrText)}  (<b>%</b> ${escapeHtml(atrPctText)})`);
+        lines.push(`<b>${t('cex.analysis_volume', chatId)}:</b> ${escapeHtml(String(data.volume !== undefined ? String(data.volume) : 'n/a'))}  (<b>Δ</b> ${escapeHtml(data.volume_change !== undefined && data.volume_change !== null ? (Number(data.volume_change)*100).toFixed(2)+'%' : 'n/a')})`);
+        // trend / advice
+        if (data.trend) {
+          // nicer score bar
+          if (data.score !== undefined && data.score !== null) {
+            try {
+              const sc = Math.max(0, Math.min(100, Number(data.score)));
+              const filled = Math.round((sc/100) * 10);
+              const empty = 10 - filled;
+              const bar = '🟩'.repeat(filled) + '⬜'.repeat(empty);
+              lines.push(`<b>${t('cex.analysis_score', chatId)}:</b> ${escapeHtml(String(sc))} ${escapeHtml(bar)}`);
+            } catch (e) { lines.push(`<b>${t('cex.analysis_score', chatId)}:</b> ${escapeHtml(String(data.score))}`); }
+          }
+          lines.push(`<b>${t('cex.analysis_trend', chatId)}:</b> ${escapeHtml(String(data.trend))}  |  <b>${t('cex.analysis_position', chatId)}:</b> ${escapeHtml(String(data.position_sizing || 'n/a'))}`);
+        }
+        if (Array.isArray(data.advice) && data.advice.length) {
+          const localized = localizeAdvice(chatId, data.advice);
+          lines.push(`<b>${t('cex.analysis_advice', chatId)}:</b> ${escapeHtml(localized.join(' \n'))}`);
+        }
+        if (data.rsi !== undefined && data.rsi !== null) {
+          lines.push(`<b>RSI:</b> ${escapeHtml(String(Number(data.rsi).toFixed(2)))}  |  <b>EMA slope:</b> ${escapeHtml(data.ema_slope !== null && data.ema_slope !== undefined ? (Number(data.ema_slope)*100).toFixed(2)+'%' : 'n/a')}`);
+        }
+        // suggested levels
+        if (data.suggested) {
+          const s = data.suggested;
+          lines.push(`<b>${t('cex.analysis_suggested', chatId)}:</b> ${t('cex.analysis_entry', chatId)} ${escapeHtml(fmtNum(s.entry,6))} — ${t('cex.analysis_sl', chatId)} ${escapeHtml(fmtNum(s.sl,6))} — ${t('cex.analysis_tp', chatId)} ${escapeHtml(fmtNum(s.tp,6))}`);
+          lines.push(`<b>${t('cex.analysis_risk', chatId)}:</b> ${escapeHtml(String(s.risk_pct))}%`);
+        }
+        // recommendation (structured)
+        if (data.recommendation) {
+          try {
+            const rec = data.recommendation as any;
+            // map action to localized label
+            const actionMap: Record<string,string> = {
+              'enter_long': t('cex.reco_enter_long', chatId),
+              'enter_short': t('cex.reco_enter_short', chatId),
+              'consider_enter': t('cex.reco_consider', chatId),
+              'wait': t('cex.reco_wait', chatId)
+            };
+            const actionLabel = actionMap[rec.action] || escapeHtml(String(rec.action || 'n/a'));
+            lines.push(`<b>${t('cex.analysis_recommendation', chatId)}:</b> ${escapeHtml(actionLabel)}`);
+            if (rec.entry !== undefined && rec.entry !== null) lines.push(`<b>${t('cex.analysis_entry', chatId)}:</b> ${escapeHtml(fmtNum(rec.entry,6))}`);
+            if (Array.isArray(rec.entry_zone) && rec.entry_zone.length===2) lines.push(`<b>${t('cex.analysis_entry', chatId)} ${t('cex.analysis_zone', chatId)}:</b> ${escapeHtml(fmtNum(rec.entry_zone[0],6))} - ${escapeHtml(fmtNum(rec.entry_zone[1],6))}`);
+            if (rec.sl !== undefined && rec.sl !== null) lines.push(`<b>${t('cex.analysis_sl', chatId)}:</b> ${escapeHtml(fmtNum(rec.sl,6))}`);
+            if (Array.isArray(rec.tps) && rec.tps.length) {
+              const tps = rec.tps.map((x: any, i: number) => `${t('cex.analysis_tp', chatId)}${i+1}:${fmtNum(x,6)}`);
+              lines.push(`<b>${t('cex.analysis_tp', chatId)}s:</b> ${escapeHtml(tps.join(' | '))}`);
+            }
+            if (rec.risk_pct !== undefined && rec.risk_pct !== null) lines.push(`<b>${t('cex.analysis_risk', chatId)}:</b> ${escapeHtml(String(rec.risk_pct))}%`);
+            // show explanation lines (try to localize simple codes if present)
+            if (Array.isArray(rec.explain) && rec.explain.length) {
+              // prefer structured explain_codes localization when available
+              if (Array.isArray(rec.explain_codes) && rec.explain_codes.length) {
+                const localizedExplain: string[] = [];
+                for (const ec of rec.explain_codes) {
+                  try {
+                    const code = String(ec.code || '');
+                    const vars = (ec.vars && typeof ec.vars === 'object') ? ec.vars : undefined;
+                    const translated = t(`cex.${code}`, chatId, vars as any);
+                    if (translated && translated !== `cex.${code}`) localizedExplain.push(translated);
+                    else localizedExplain.push(escapeHtml(String(ec.text || '')));
+                  } catch (e) { localizedExplain.push(escapeHtml(String(ec.text || ''))); }
+                }
+                lines.push(`<b>${t('cex.analysis_explain', chatId)}:</b> ${escapeHtml(localizedExplain.join(' \n '))}`);
+              } else {
+                const explainLines = rec.explain.map((ln: string) => escapeHtml(String(ln)));
+                lines.push(`<b>${t('cex.analysis_explain', chatId)}:</b> ${explainLines.join(' \n ')}`);
+              }
+            }
+          } catch (e) { /* ignore render error */ }
+        }
+        // higher timeframe bias
+        if (data.higher_timeframe_bias) {
+          const parts: string[] = [];
+          for (const k of Object.keys(data.higher_timeframe_bias)) {
+            parts.push(`${k}: ${data.higher_timeframe_bias[k]}`);
+          }
+          lines.push(`<b>${t('cex.analysis_ht_bias', chatId)}:</b> ${escapeHtml(parts.join(' | '))}`);
+        }
+
+        const html = lines.join('\n');
+        // suggest buy button
+        const defaultUsdt = 50;
+        const rows: any[] = [ [ { text: '✅ ' + t('cex.suggest_buy', chatId), callback_data: `cex_suggest_buy_${encodeURIComponent(text)}` }, { text: t('cex.cancel_button', chatId), callback_data: 'cex_cancel' } ] ];
+        await ctx.reply(html, { reply_markup: { inline_keyboard: rows }, parse_mode: 'HTML' } as any);
+        cex.addTradeRecord(chatId, { action: 'analyze_result', symbol: text, analysis: data });
+      } catch (e: any) { console.error('analysis request error', e); await ctx.reply(t('cex.analysis_failed', chatId, { symbol: text, err: (e && e.message) || String(e) })); }
+      return;
+    }
+    // If user is expected to send trade request details
+    const expectingTrades = (globalThis as any).__expectingCexTradeRequest as Set<string>;
+    if (expectingTrades && expectingTrades.has(chatId)) {
+      expectingTrades.delete(chatId);
+      try {
+  await ctx.reply(t('cex.trade_request_received', chatId, { details: text }));
+        const cex = require('./cexSniper.js');
+        cex.addTradeRecord(chatId, { action: 'trade_request', details: text });
+      } catch (e: any) { console.error('trade request error', e); }
+      return;
     }
   if (String(text).toUpperCase() === 'CONFIRM') {
       if (pending && pending.has(chatId)) {
@@ -611,11 +821,6 @@ bot.start(async (ctx) => {
     t('common.welcome', userId),
     getMainReplyKeyboard(userId)
   );
-});
-
-// Show language selector immediately on start if user has no language set
-bot.start(async (ctx) => {
-  const userId = String(ctx.from?.id);
   const usersAll = loadUsers();
   const u = usersAll[userId] || {};
   if (!u.lang) {
@@ -623,9 +828,58 @@ bot.start(async (ctx) => {
     const buttons = langs.map(l => Markup.button.callback(l, `setlang_${l}`));
     const rows: any[] = [];
     for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
-    await ctx.reply('Choose language / اختر اللغة:', { reply_markup: { inline_keyboard: rows } } as any);
+  await ctx.reply(t('main_extra.choose_language', userId), { reply_markup: { inline_keyboard: rows } } as any);
   }
 });
+
+// Handler for suggestion buy button from analysis
+bot.action(/cex_suggest_buy_(.+)/, async (ctx: any) => {
+  try {
+    const data = String((ctx.callbackQuery as any).data || '');
+    const m = data.match(/^cex_suggest_buy_(.+)$/);
+    if (!m) return;
+    const symbol = decodeURIComponent(m[1]);
+    const userId = String(ctx.from?.id);
+    // default trade size (USDT) — try to read from user's strategy or fallback to 50
+    users = loadUsers();
+    const user = users[userId] || {};
+    const defaultUsdt = (user && user.strategy && user.strategy.buyAmount) ? Number(user.strategy.buyAmount) : 50;
+  const rows: any[] = [ [ { text: '✅ ' + t('cex.suggest_buy', userId), callback_data: `cex_confirm_buy_${encodeURIComponent(symbol)}_${defaultUsdt}` }, { text: t('cex.cancel_button', userId), callback_data: 'cex_cancel' } ] ];
+  await ctx.reply(t('cex.confirm_buy_prompt', userId, { symbol, amount: String(defaultUsdt) }), { reply_markup: { inline_keyboard: rows } } as any);
+  } catch (e: any) { console.error('cex_suggest_buy error', e); await ctx.reply(t('cex.internal_error', String(ctx.from?.id))); }
+});
+
+// Confirm buy handler — runs filters then calls executeOrder (stubbed unless ENABLE_CEX_EXECUTION=true)
+bot.action(/cex_confirm_buy_(.+)_(.+)/, async (ctx: any) => {
+  try {
+    const data = String((ctx.callbackQuery as any).data || '');
+    const m = data.match(/^cex_confirm_buy_(.+)_(.+)$/);
+    if (!m) return;
+    const symbol = decodeURIComponent(m[1]);
+    const usdtSize = Number(m[2]) || 50;
+    const userId = String(ctx.from?.id);
+    // get keys
+    const keys = await cryptoGetUserKeys(userId);
+    if (!keys) return ctx.reply(t('cex.no_keys_saved', userId));
+    const cex = require('./cexSniper.js');
+    // re-run analysis to ensure filters pass
+  // re-run analysis using user's configured platform when available
+  users = loadUsers();
+  const u2 = users[userId] || {};
+  const platform2 = (u2.cex && u2.cex.platform) ? u2.cex.platform : undefined;
+  const analysisRes = await cex.analyzeSymbol(userId, symbol, { platform: platform2 });
+    if (!analysisRes || !analysisRes.ok) return ctx.reply(t('cex.analysis_no_results', userId));
+    const pass = cex._passesFilters(analysisRes.data, {});
+    if (!pass || !pass.ok) return ctx.reply(t('cex.filtered_security', userId, { reason: String(pass.reason || pass.err || 'filtered') }));
+    const execRes = await cex.executeOrder(userId, symbol, 'BUY', usdtSize, keys, {});
+    if (execRes && execRes.ok) {
+      return ctx.reply(t('cex.buy_recorded_generic', userId, { res: JSON.stringify(execRes) }));
+    }
+    return ctx.reply(t('cex.buy_failed', userId, { err: (execRes && execRes.err ? String(execRes.err) : 'unknown') }));
+  } catch (e: any) { console.error('cex_confirm_buy error', e); return ctx.reply(t('cex.internal_error', String(ctx.from?.id))); }
+});
+
+bot.action('cex_cancel', async (ctx) => { try { await ctx.reply(t('cex.cancelled', String(ctx.from?.id))); } catch (_) {} });
 
 // Command to set language for a user
 bot.command('setlang', async (ctx) => {
@@ -634,7 +888,7 @@ bot.command('setlang', async (ctx) => {
   const buttons = langs.map(l => Markup.button.callback(l, `setlang_${l}`));
   const rows: any[] = [];
   for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
-  await ctx.reply('Choose language / اختر اللغة:', { reply_markup: { inline_keyboard: rows } } as any);
+  await ctx.reply(t('main_extra.choose_language', String(ctx.from?.id)), { reply_markup: { inline_keyboard: rows } } as any);
 });
 
 // Unified handler for setlang callbacks: set language, confirm, and resend updated keyboard
@@ -818,11 +1072,27 @@ bot.on('text', async (ctx, next) => {
         await ctx.reply(t('cex.private_chat_required', userId));
         return;
       }
-      users = loadUsers();
-      const expecting = (globalThis as any).__expectingCexKeys as Set<string>;
-      expecting.add(userId);
+  users = loadUsers();
       const have = users[userId] && users[userId].cex ? 'You already have keys saved. Sending new keys will require CONFIRM to overwrite.' : '';
-      return await ctx.reply(t('cex.prompt_enter_keys', userId, { have: have, after: users[userId] && users[userId].cex ? tForLang('cex.already_have_keys', (users[userId] && users[userId].lang) || 'en') : tForLang('cex.api_keys_saved', (users[userId] && users[userId].lang) || 'en') }));
+      // Show inline submenu for CEX sniper controls (start/stop/status/history/change keys)
+      const rows: any[] = [];
+      rows.push([
+        { text: '▶️ ' + t('cex.start_sniper', userId), callback_data: 'cex_start' },
+        { text: '⏹️ ' + t('cex.stop_sniper', userId), callback_data: 'cex_stop' }
+      ]);
+      rows.push([
+        { text: '📊 ' + t('cex.status', userId), callback_data: 'cex_status' },
+        { text: '📜 ' + t('cex.history', userId), callback_data: 'cex_history' }
+      ]);
+      rows.push([
+        { text: '🔑 ' + t('cex.change_keys', userId), callback_data: 'cex_change_keys' }
+      ]);
+      // Add Request Tokens and Enable Live Trading buttons
+      rows.push([
+        { text: '🧾 ' + t('cex.menu_request_tokens', userId), callback_data: 'cex_request_tokens' },
+        { text: '⚡ ' + t('cex.menu_enable_live', userId), callback_data: 'cex_enable_live' }
+      ]);
+      return await ctx.reply(t('cex.prompt_enter_keys', userId, { have: have, after: users[userId] && users[userId].cex ? tForLang('cex.already_have_keys', (users[userId] && users[userId].lang) || 'en') : tForLang('cex.api_keys_saved', (users[userId] && users[userId].lang) || 'en') }), { reply_markup: { inline_keyboard: rows }, parse_mode: 'HTML' } as any);
     } catch (e) {
       console.error('[Sniper-CEX] handler error', e);
       try { return await ctx.reply('❌ Failed to start CEX key prompt.'); } catch (_) { return; }
@@ -867,6 +1137,148 @@ bot.action('reveal_full_secret', async (ctx) => {
   } else {
     await ctx.reply(t('common.no_wallet', userId));
   }
+});
+
+// === CEX sniper callback handlers ===
+bot.action('cex_start', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    const keys = await cryptoGetUserKeys(userId);
+    if (!keys) return ctx.reply(t('cex.no_keys_saved', userId));
+    // dynamic require so module is optional
+    const cex = require('./cexSniper.js');
+    const res = await cex.startUserCexSniper(userId, { apiKey: keys.apiKey, apiSecret: keys.apiSecret, platform: (users[userId] && users[userId].cex && users[userId].cex.platform) || 'BINANCE' }, {});
+    return ctx.reply(res && res.ok ? t('cex.sniper_started', userId) : t('cex.sniper_start_failed', userId, { err: res && res.err ? String(res.err) : 'unknown' }));
+  } catch (e: any) { console.error('cex_start error', e); return ctx.reply(t('cex.sniper_start_failed', userId, { err: (e && e.message) || String(e) })); }
+});
+
+bot.action('cex_stop', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    const cex = require('./cexSniper.js');
+    const res = await cex.stopUserCexSniper(userId);
+    return ctx.reply(res && res.ok ? t('cex.sniper_stopped', userId) : t('cex.sniper_stop_failed', userId, { err: res && res.err ? String(res.err) : 'unknown' }));
+  } catch (e: any) { console.error('cex_stop error', e); return ctx.reply(t('cex.sniper_stop_failed', userId, { err: (e && e.message) || String(e) })); }
+});
+
+bot.action('cex_status', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    const cex = require('./cexSniper.js');
+    const res = await cex.getUserCexSniperStatus(userId);
+    if (!res || !res.ok) return ctx.reply(t('cex.sniper_status_failed', userId, { err: res && res.err ? String(res.err) : 'unknown' }));
+    if (res.running) return ctx.reply(t('cex.sniper_running_since', userId, { since: new Date(res.since).toLocaleString() }));
+    return ctx.reply(t('cex.sniper_not_running', userId));
+  } catch (e: any) { console.error('cex_status error', e); return ctx.reply(t('cex.sniper_status_failed', userId, { err: (e && e.message) || String(e) })); }
+});
+
+bot.action('cex_history', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    const cex = require('./cexSniper.js');
+    const res = await cex.getUserTradeHistory(userId);
+    if (!res || !res.ok) return ctx.reply(t('cex.history_failed', userId, { err: res && res.err ? String(res.err) : 'unknown' }));
+    const lines = (res.trades || []).slice(-20).reverse().map((r: any) => {
+      const ts = r.ts ? new Date(r.ts).toLocaleString() : 'n/a';
+      return `${ts} ${r.side||r.action||''} ${r.symbol||''} ${r.size?('size='+r.size):''} ${r.note?r.note:''}`.trim();
+    });
+    if (lines.length === 0) return ctx.reply(t('cex.no_history', userId));
+    // chunk replies
+    for (let i = 0; i < lines.length; i += 20) await ctx.reply(lines.slice(i, i + 20).join('\n'));
+    return;
+  } catch (e: any) { console.error('cex_history error', e); return ctx.reply(t('cex.history_failed', userId, { err: (e && e.message) || String(e) })); }
+});
+
+bot.action('cex_change_keys', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    // Reuse the existing flow: mark expecting set and instruct user to paste keys
+    const expecting = (globalThis as any).__expectingCexKeys as Set<string>;
+    expecting.add(userId);
+    return ctx.reply(t('cex.prompt_enter_keys', userId));
+  } catch (e: any) { console.error('cex_change_keys error', e); return ctx.reply(t('cex.api_keys_save_failed', userId)); }
+});
+
+// Show submenu for token requests (analysis / trade request)
+bot.action('cex_request_tokens', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    // Clear any pending CEX key expectations so token input won't be misinterpreted
+    try { (globalThis as any).__expectingCexKeys && (globalThis as any).__expectingCexKeys.delete(userId); } catch (_) {}
+    try { (globalThis as any).__pendingPartial && (globalThis as any).__pendingPartial.delete(userId); } catch (_) {}
+    const rows: any[] = [];
+    rows.push([
+      { text: '🔎 ' + t('cex.menu_analyze_token', userId), callback_data: 'cex_analyze_token' },
+      { text: '📩 ' + t('cex.menu_request_trades', userId), callback_data: 'cex_request_trades' }
+    ]);
+    rows.push([ { text: '⬅️ ' + t('cex.menu_back', userId), callback_data: 'cex_back' } ]);
+    return await ctx.reply('اختر إجراء لطلب العملات:', { reply_markup: { inline_keyboard: rows } } as any);
+  } catch (e: any) { console.error('cex_request_tokens error', e); return ctx.reply('خطأ داخلي'); }
+});
+
+// Analyze token stub — asks user to send token symbol or address for analysis
+bot.action('cex_analyze_token', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    // Ensure we are not in key-entry mode
+    try { (globalThis as any).__expectingCexKeys && (globalThis as any).__expectingCexKeys.delete(userId); } catch (_) {}
+    try { (globalThis as any).__pendingPartial && (globalThis as any).__pendingPartial.delete(userId); } catch (_) {}
+    (globalThis as any).__expectingCexTokenAnalysis.add(userId);
+      return ctx.reply(t('cex.prompt_send_token', userId));
+  } catch (e: any) { console.error('cex_analyze_token error', e); return ctx.reply('خطأ داخلي'); }
+});
+
+// Request trades stub — asks user to send trade request details
+bot.action('cex_request_trades', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+  // Ensure we are not in key-entry mode
+  try { (globalThis as any).__expectingCexKeys && (globalThis as any).__expectingCexKeys.delete(userId); } catch (_) {}
+  try { (globalThis as any).__pendingPartial && (globalThis as any).__pendingPartial.delete(userId); } catch (_) {}
+  (globalThis as any).__expectingCexTradeRequest.add(userId);
+  return ctx.reply(t('cex.prompt_send_trade', userId));
+  } catch (e: any) { console.error('cex_request_trades error', e); return ctx.reply('خطأ داخلي'); }
+});
+
+// Enable live trading handler — will start cexSniper in live-mode (record only, no real orders)
+bot.action('cex_enable_live', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    const keys = await cryptoGetUserKeys(userId);
+    if (!keys) return ctx.reply(t('cex.no_keys_saved', userId));
+    const cex = require('./cexSniper.js');
+    const res = await cex.startUserCexSniper(userId, { apiKey: keys.apiKey, apiSecret: keys.apiSecret, platform: (users[userId] && users[userId].cex && users[userId].cex.platform) || 'BINANCE' }, { live: true });
+    if (res && res.ok) {
+      return ctx.reply(t('cex.live_enabled', userId));
+    }
+    return ctx.reply(t('cex.live_enable_failed', userId, { err: (res && res.err ? String(res.err) : 'unknown') }));
+  } catch (e: any) { console.error('cex_enable_live error', e); return ctx.reply('خطأ أثناء تفعيل التداول الحي: ' + (e && e.message ? e.message : String(e))); }
+});
+
+// Simple back handler to re-open main CEX submenu
+bot.action('cex_back', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    // Rebuild the same submenu used when opening Sniper CEX
+    users = loadUsers();
+    const rows: any[] = [];
+    rows.push([
+      { text: '▶️ ' + t('cex.start_sniper', userId), callback_data: 'cex_start' },
+      { text: '⏹️ ' + t('cex.stop_sniper', userId), callback_data: 'cex_stop' }
+    ]);
+    rows.push([
+      { text: '📊 ' + t('cex.status', userId), callback_data: 'cex_status' },
+      { text: '📜 ' + t('cex.history', userId), callback_data: 'cex_history' }
+    ]);
+    rows.push([
+      { text: '🔑 ' + t('cex.change_keys', userId), callback_data: 'cex_change_keys' }
+    ]);
+    rows.push([
+      { text: '🧾 ' + t('cex.menu_request_tokens', userId), callback_data: 'cex_request_tokens' },
+      { text: '⚡ ' + t('cex.menu_enable_live', userId), callback_data: 'cex_enable_live' }
+    ]);
+    return ctx.reply(t('cex.prompt_enter_keys', userId, { have: '', after: '' }), { reply_markup: { inline_keyboard: rows }, parse_mode: 'HTML' } as any);
+  } catch (e: any) { console.error('cex_back error', e); return ctx.reply(t('cex.internal_error', userId)); }
 });
 
 bot.action('create_or_change_wallet_inline', async (ctx) => {
